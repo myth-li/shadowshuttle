@@ -20,6 +20,7 @@ import {
   socks5Greeting, socks5AuthRequest, socks5ConnectRequest, expandIPv6, socks5CheckReply,
   buildHttpConnectReq, indexOfSeq, chainAllows, chainNeedsTls,
   buildDialPlan, computeDialTimeout, raceDials,
+  parseTrojanFallback,
   clampPort, clampInt,
 } from './_worker.js';
 import { createHash, createCipheriv, createDecipheriv, hkdfSync, randomBytes } from 'node:crypto';
@@ -386,6 +387,17 @@ console.log('[21] gRPC trailer 帧');
   ok('trailer 含 grpc-status:0', body.includes('grpc-status:0'));
   const tr2 = grpcEncodeTrailer(13, 'boom');
   ok('trailer 非零状态', new TextDecoder().decode(grpcDecode(tr2).frames[0]).includes('grpc-status:13'));
+}
+
+console.log('[22] Trojan fallback 路径解析');
+{
+  eq('IPv4', parseTrojanFallback('trojan=1.1.1.1:1234'), { host: '1.1.1.1', port: 1234 });
+  eq('域名', parseTrojanFallback('trojan=relay.example.com:443'), { host: 'relay.example.com', port: 443 });
+  eq('IPv6括号', parseTrojanFallback('trojan=[::1]:8443'), { host: '[::1]', port: 8443 });
+  eq('无端口拒绝', parseTrojanFallback('trojan=1.1.1.1'), null);
+  eq('端口越界拒绝', parseTrojanFallback('trojan=1.1.1.1:99999'), null);
+  eq('普通路径拒绝', parseTrojanFallback('trojan'), null);
+  eq('空拒绝', parseTrojanFallback(''), null);
 }
 
 console.log(`\n结果：${pass} 通过，${fail} 失败`);

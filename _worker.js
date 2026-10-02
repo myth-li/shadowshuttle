@@ -3353,6 +3353,9 @@ async function readHeader(reader, parseFn, earlyData) {
     const res = parseFn(buf); // 抛错 = 非法请求
     if (res) {
       reader.prepend(buf.subarray(res.headerLen));
+      // 透传场景（如 Trojan fallback）需要原始头字节，这里一并带出；
+      // 普通代理路径用不到，忽略即可。
+      res.raw = buf.subarray(0, res.headerLen);
       return res;
     }
     if (buf.length > 16384) throw new Error('header too large');
@@ -3508,13 +3511,64 @@ async function handleVless(server, request, env, cfg) {
   }
 }
 
-async function handleTrojan(server, request, env, cfg) {
+/** 解析 /trojan=IP:端口 路径（纯函数）。
+ * 用途：Trojan fallback——用户自建的有完整 UDP 能力的 Trojan 服务器地址。
+ * 示例：trojan=1.1.1.1:1234 → {host:'1.1.1.1', port:1234} */
+export function parseTrojanFallback(seg) {
+  const m = /^trojan=(.+):(\d+)$/.exec(String(seg || ''));
+  if (!m) return null;
+  const port = Number(m[2]);
+  if (!m[1] || !(port > 0 && port < 65536)) return null;
+  return { host: m[1], port };
+}
+
+/** Trojan UDP 透传到自建 fallback。
+ * 为什么需要透传而不是本地终结：Workers 没有 UDP 出站 socket，UDP 包无法
+ * 从 Worker 直接发出去（v2 里只能把 DNS 挑出来走 DoH 中继，非 DNS 直接丢弃）。
+ * fallback 是用户自建的、有完整 UDP 能力的 Trojan 服务器。这里只做"认证后
+ * 透传"：先校验 Trojan 密码（防止未授权蹭用），然后把原始字节流（含 Trojan
+ * 头）原样转发给 fallback，由它解析并完成 UDP 转发；回包再原样送回客户端。
+ * 出站走统一 dialOut（直连/链式/回落策略与面板一致）。 */
+async function pipeTrojanToFallback(ws, reader, rawHeader, fallback, cfg) {
+  const sock = await dialOut(fallback.host, fallback.port, cfg);
+  const w = sock.writable.getWriter();
+  const r = sock.readable.getReader();
+  try {
+    await w.write(rawHeader);
+    const up = (async () => {
+      for (;;) {
+        const chunk = await reader.read();
+        if (chunk === null) break;
+        await w.write(chunk);
+      }
+    })();
+    const down = (async () => {
+      for (;;) {
+        const { done, value } = await r.read();
+        if (done) break;
+        if (value && value.length && ws.readyState === 1) ws.send(value);
+      }
+    })();
+    await Promise.race([up, down]);
+  } finally {
+    try { w.releaseLock(); } catch { /* 忽略 */ }
+    try { r.cancel(); } catch { /* 忽略 */ }
+    try { sock.close(); } catch { /* 忽略 */ }
+    try { ws.close(); } catch { /* 忽略 */ }
+  }
+}
+
+async function handleTrojan(server, request, env, cfg, fallback) {
   const ws = server;
   try {
     const pwdHash = trojanPasswordHash(cfg.trojanPassword);
     const reader = new WsReader(ws);
     const hdr = await readHeader(reader, (b) => parseTrojanHeader(b, pwdHash), getEarlyData(request));
-    if (hdr.cmd === 0x03) { await handleTrojanUdp(ws, reader); return; }
+    if (hdr.cmd === 0x03) {
+      // UDP：有 fallback 则认证后透传给自建服务器；无 fallback 走 DoH（仅 DNS）。
+      if (fallback && hdr.raw) { await pipeTrojanToFallback(ws, reader, hdr.raw, fallback, cfg); return; }
+      await handleTrojanUdp(ws, reader); return;
+    }
     const socket = await tcpConnectWithFallback(hdr.addr, hdr.port, cfg);
     await bridgeWsTcp(ws, socket, reader, {});
   } catch {
@@ -3884,10 +3938,13 @@ export default {
         ctx.waitUntil((async () => { try { await fn(server); } catch { /* 忽略 */ } })());
         return new Response(null, { status: 101, webSocket: client });
       };
-      if (seg === 'trojan') {
+      if (seg === 'trojan' || seg.startsWith('trojan=')) {
         if (!cfg.trojanPassword) return new Response('trojan disabled', { status: 404 });
+        // /trojan=IP:端口：Trojan fallback 路径，UDP 认证后透传给自建服务器
+        const fb = seg.startsWith('trojan=') ? parseTrojanFallback(seg) : null;
+        if (seg.startsWith('trojan=') && !fb) return new Response('bad fallback', { status: 400 });
         logAndNotifyProxy(request, env, ctx, cfg, 'trojan');
-        return run((s) => handleTrojan(s, request, env, cfg));
+        return run((s) => handleTrojan(s, request, env, cfg, fb));
       }
       if (seg === 'ss') {
         if (!cfg.ssPassword) return new Response('ss disabled', { status: 404 });
