@@ -1,0 +1,27 @@
+# myth-tunnel 的 wrangler 部署配置
+# 用法：wrangler deploy
+# 注意：不要用 wrangler 部署到已有的线上 Worker（会覆盖对应 name 的项目），
+# 建议先在 dashboard 新建 Worker 粘贴 _worker.js 测试，确认无误后再切换域名。
+
+name = "myth-tunnel"
+main = "_worker.js"
+compatibility_date = "2026-01-01"
+
+# ---- KV 绑定（变量名必须叫 KV，代码里用 env.KV 访问） ----
+# 获取 namespace id：dashboard → Storage & databases → KV → 创建 namespace 后复制 ID，
+# 或运行 wrangler kv namespace create KV
+[[kv_namespaces]]
+binding = "KV"
+id = ""  # ← 填入你的 KV namespace ID；dashboard 部署时也可直接在 Bindings 里绑定变量名 KV
+
+# ---- 必填变量（三选：dashboard Variables / wrangler secret / 下面 [vars] 明文） ----
+# ADMIN     后台管理密码（/login、/admin、/api/* 用）
+# UUID      VLESS 主 UUID（标准 8-4-4-4-12 格式）
+# SUB_TOKEN 订阅路径 token（随机字符串，如 7aced1ed…，别人猜不到你的订阅地址）
+#
+# 安全建议：ADMIN 务必用 wrangler secret put ADMIN（或 dashboard 设为 Secret 类型），
+# 不要把真实密码写进下面的 [vars] 再提交到 git。
+# [vars]
+# ADMIN = ""
+# UUID = ""
+# SUB_TOKEN = ""
