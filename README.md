@@ -14,12 +14,12 @@
 
 ## ✨ 功能亮点
 
-- **三协议全支持**：VLESS、Trojan、Shadowsocks（AES-128-GCM / AES-256-GCM / ChaCha20-Poly1305）全部跑在 WebSocket 上，一个 Worker 全搞定
-- **优选 IP 订阅**：来源 URL 自动抓取 + 静态列表，去重聚合，每个 IP 自动生成 VLESS / Trojan / SS 三个节点
-- **看得懂的节点名**：`🇺🇸 美国 01`、`🇭🇰 香港 02` —— 国旗 emoji + 中文国名（内置约 240 项映射）+ 全局序号，订阅里一眼找到想要的线路
-- **三种订阅格式**：通用 base64（v2rayN / Shadowrocket）、Clash YAML、sing-box JSON，一次配置多端通用
-- **现代简约管理面板**：无外部依赖、单文件离线可用；多用户、密码、优选 IP 源、回落 IP、伪装页全部可视化配置
-- **智能回落**：出站直连失败时自动用 proxyIP 重试一次；伪装首页让扫描器无功而返
+- **三协议 + 三传输**：VLESS、Trojan、Shadowsocks（AES-128-GCM / AES-256-GCM / ChaCha20-Poly1305），跑在 WebSocket / gRPC / XHTTP 上，一个 Worker 全搞定
+- **优选 IP 全都要**：静态列表（`IP` / `IP:端口` / `IP#备注`）+ URL 文本源 + `sub://` 聚合源 + **内置随机生成器**（从 Cloudflare 公开 IP 段随机抽取，默认 16 个，零配置可用）
+- **看得懂的节点名**：`🇺🇸 美国 01`、`🇭🇰 香港 02` —— 国旗 emoji + 中文国名（内置约 240 项映射）+ 全局序号，归属地自动查询 + KV 缓存 30 天
+- **六种订阅格式**：通用 base64、Clash、sing-box、Surge、Quantumult X、Loon；`?target=` 指定、UA 自动识别；`?sub=` 再聚合一个外部订阅；多 HOST 轮换；`/{KEY}` 快速订阅
+- **链式代理出站**：SOCKS5 / HTTP 代理链，可配账号密码与域名白名单；拨号顺序直连 → 代理链 → PROXYIP 回落
+- **现代管理面板**：深色模式、订阅二维码、折叠卡片、状态仪表盘、3 步引导；请求日志、TG 推送、CF 用量查询、优选源一键验证全部可视化
 - **clean-room 自研**：只参考公开协议规范逐行手写，SHA-224 / ChaCha20-Poly1305 等 Workers 缺失的算法全部内置实现
 
 ## 📸 截图
@@ -72,12 +72,22 @@ wrangler deploy
 | 配置项 | 说明 |
 |---|---|
 | multiUUID | 多用户 UUID 数组（除主 UUID 外的合法用户） |
-| trojanPassword / ssPassword / ssMethod | Trojan 密码；SS 密码与加密方式 |
-| preferredSources | 优选 IP 源 URL（每行一个；文本源每行一个 IP，抓取结果 KV 缓存 6 小时） |
-| preferredStatic | 静态优选 IP（每行一个） |
-| proxyIP | 出站直连失败时的回落 IP（可选） |
+| trojanPassword / ssPassword / ssMethod | Trojan 密码；SS 密码与加密方式（密码留空=不修改） |
+| ssAltPort | SS 非 TLS 备用端口（如 80，0=关闭） |
+| subKey | 快速订阅 KEY，`/{KEY}` 直达订阅（空=不启用） |
+| hosts | 多 HOST 轮换（空=用请求 host） |
 | nodePort | 订阅节点端口（默认 443） |
-| disguiseHTML | 伪装首页 HTML（默认 nginx 风格，可自定义） |
+| earlyData / fragment | 0RTT（`ed=2048`）/ TLS 分片开关，拼进订阅链接 |
+| preferredSources | 优选 IP 源（每行一个；`https://` 文本源 / `sub://` 聚合源，KV 缓存 6 小时） |
+| preferredStatic | 静态优选 IP（每行一个；支持 `IP` / `IP:端口` / `IP#备注`） |
+| randIPCount / randIPPort | 内置随机优选 IP 数量（默认 16，0=关闭）与端口 |
+| proxyIP | 出站失败时的回落 IP（可选） |
+| chainEnabled / chainType / chainHost / chainPort / chainUser / chainPass | 链式代理开关、类型（socks5/http）、地址、端口、账号密码 |
+| chainWhitelist | 链式代理域名白名单（空=全部走链） |
+| logEnabled | KV 请求日志开关 |
+| tgEnabled / tgBotToken / tgChatId | Telegram 推送开关与配置 |
+| cfApiToken / cfAccountId | Cloudflare API Token 与 Account ID（用量查询） |
+| disguiseHTML | 伪装首页 HTML（默认极简 404，可自定义） |
 | subPath | 订阅路径（默认 `/{SUB_TOKEN}`） |
 
 ## 📡 订阅地址
@@ -85,28 +95,40 @@ wrangler deploy
 | 格式 | 地址 | 适用客户端 |
 |---|---|---|
 | 通用 base64 | `https://<域名>/{SUB_TOKEN}` | v2rayN / v2rayNG / Shadowrocket |
-| Clash | `https://<域名>/{SUB_TOKEN}/clash` | Clash / ClashMeta |
+| Clash | `https://<域名>/{SUB_TOKEN}/clash` | Clash / ClashMeta / Stash |
 | sing-box | `https://<域名>/{SUB_TOKEN}/singbox` | sing-box / SFA |
+| Surge | `https://<域名>/{SUB_TOKEN}/surge` | Surge |
+| Quantumult X | `https://<域名>/{SUB_TOKEN}/quanx` | Quantumult X |
+| Loon | `https://<域名>/{SUB_TOKEN}/loon` | Loon |
+
+> `?target=` 可强制指定格式（如 `?target=clash`）；不带后缀时按客户端 UA 自动识别。
+> `?sub=<url>` 可再聚合一个外部订阅的节点。设了 `subKey` 后也可用 `/{KEY}` 系列短路径。
 
 ## 🗺 路由一览
 
 | 路径 | 说明 |
 |---|---|
-| `GET /` | 伪装首页 |
+| `GET /` | 伪装首页（默认极简 404） |
 | `GET /login` · `POST /api/login` | 登录（Cookie `ss_session`，KV token 1 小时过期） |
-| `GET /admin` | 管理面板（未登录跳转 `/login`） |
+| `GET /admin` | 管理面板（未登录跳转 `/login`；深色模式/二维码/引导） |
 | `GET/POST /api/config` · `/api/logout` | 读写配置 / 登出（需登录） |
+| `GET /api/logs` · `/api/test-source` · `/api/cf-usage` · `/api/check-proxy` | 日志 / 优选源验证 / CF 用量 / 代理检查（需登录） |
 | WS `/{UUID}` | VLESS（含 early data） |
 | WS `/trojan` | Trojan（sha224 hex 验密码，常量时间比较） |
 | WS `/ss` | Shadowsocks AEAD |
+| `POST` + `application/grpc` | gRPC 传输（VLESS/Trojan，TCP） |
+| `POST` + `x-padding` 头或 `?xhttp=` | XHTTP 传输（stream-one 基础模式） |
 
 ## 🧪 自测
 
 纯逻辑部分有 node 自测脚本（不依赖 Workers API），提交前已全量通过：
 
 ```bash
-node test.mjs   # 45 项：RFC 8439 向量、node:crypto 交叉验证、协议头解析、订阅拼装…
+node test.mjs   # 113 项：RFC 8439 向量、node:crypto 交叉验证、协议头解析、
+                # gRPC 帧、SOCKS5 握手字节、订阅拼装（6 格式）、单 IP 解析、CIDR 随机…
 ```
+
+版本变更记录见 [CHANGELOG.md](https://github.com/myth-li/shadowshuttle/blob/main/CHANGELOG.md)。
 
 ## ⚠️ 已知限制
 
@@ -129,12 +151,12 @@ MIT —— 详见 [LICENSE](https://github.com/myth-li/shadowshuttle/blob/main/L
 
 ## ✨ Highlights
 
-- **All three protocols**: VLESS, Trojan, Shadowsocks (AES-128-GCM / AES-256-GCM / ChaCha20-Poly1305) over WebSocket — one Worker does it all
-- **Preferred-IP subscriptions**: auto-fetch from source URLs + static list, deduplicated; every IP becomes 3 nodes (one per protocol)
-- **Readable node names**: `🇺🇸 United States 01` — flag emoji + Chinese country name (built-in ~240-entry map) + global sequence number
-- **3 subscription formats**: generic base64 (v2rayN / Shadowrocket), Clash YAML, sing-box JSON
-- **Modern minimal admin panel**: no external CDN, works offline as a single file; manage users, passwords, IP sources, fallback IP and disguise page visually
-- **Smart fallback**: retries once via `proxyIP` when direct outbound fails; disguise homepage shrugs off scanners
+- **3 protocols × 3 transports**: VLESS, Trojan, Shadowsocks (AES-128-GCM / AES-256-GCM / ChaCha20-Poly1305) over WebSocket / gRPC / XHTTP — one Worker does it all
+- **Every preferred IP**: static list (`IP` / `IP:port` / `IP#remark`) + URL text sources + `sub://` aggregation + **built-in random generator** (random picks from Cloudflare's public ranges, 16 by default, zero-config)
+- **Readable node names**: `🇺🇸 United States 01` — flag emoji + Chinese country name (built-in ~240-entry map) + global sequence number, geo-lookup with 30-day KV cache
+- **6 subscription formats**: generic base64, Clash, sing-box, Surge, Quantumult X, Loon; `?target=` override, UA auto-detect; `?sub=` merges another subscription; multi-HOST rotation; `/{KEY}` quick path
+- **Chained outbound**: SOCKS5 / HTTP proxy chaining with auth + domain whitelist; dial order direct → chain → PROXYIP fallback
+- **Modern admin panel**: dark mode, QR codes, collapsible cards, status dashboard, 3-step guide; request logs, Telegram push, CF usage meter, one-click source validation
 - **Clean-room implementation**: hand-written from public protocol specs only; missing Workers primitives (SHA-224, ChaCha20-Poly1305) implemented in pure JS
 
 ## 🚀 Deploy in 3 steps
@@ -154,20 +176,32 @@ Open `https://<your-domain>/login` and add your preferred IPs.
 
 `ADMIN` / `UUID` / `SUB_TOKEN` come from Worker Variables only. Everything else is editable
 in the admin panel and stored in KV (key `ss:config`): `multiUUID`, `trojanPassword`,
-`ssPassword`, `ssMethod`, `preferredSources`, `preferredStatic`, `proxyIP`, `nodePort`,
-`disguiseHTML`, `subPath`.
+`ssPassword`, `ssMethod`, `ssAltPort`, `subKey`, `hosts`, `nodePort`, `earlyData`, `fragment`,
+`preferredSources` (`https://` / `sub://`), `preferredStatic` (`IP` / `IP:port` / `IP#remark`),
+`randIPCount`, `randIPPort`, `proxyIP`, chain proxy settings (`chainEnabled`/`chainType`/`chainHost`/`chainPort`/`chainUser`/`chainPass`/`chainWhitelist`),
+`logEnabled`, `tgEnabled`/`tgBotToken`/`tgChatId`, `cfApiToken`/`cfAccountId`,
+`disguiseHTML`, `subPath`. Password fields are never echoed back; empty = keep.
 
 ## 📡 Subscriptions
 
 - `https://<domain>/{SUB_TOKEN}` — generic base64 (v2rayN / Shadowrocket)
 - `https://<domain>/{SUB_TOKEN}/clash` — Clash YAML
 - `https://<domain>/{SUB_TOKEN}/singbox` — sing-box JSON
+- `https://<domain>/{SUB_TOKEN}/surge` — Surge
+- `https://<domain>/{SUB_TOKEN}/quanx` — Quantumult X
+- `https://<domain>/{SUB_TOKEN}/loon` — Loon
+
+`?target=` forces a format; otherwise the client UA is sniffed. `?sub=<url>` merges an
+external subscription. `/{KEY}` short paths work when `subKey` is set.
 
 ## 🧪 Tests
 
 ```bash
-node test.mjs   # 45 checks: RFC 8439 vectors, node:crypto cross-validation, header parsing, subscription building…
+node test.mjs   # 113 checks: RFC 8439 vectors, node:crypto cross-validation, header parsing,
+                # gRPC framing, SOCKS5 handshake bytes, 6-format subscription building…
 ```
+
+See [CHANGELOG.md](https://github.com/myth-li/shadowshuttle/blob/main/CHANGELOG.md) for version history.
 
 ## ⚠️ Limitations
 
