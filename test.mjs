@@ -18,7 +18,7 @@ import {
   pickHost, subExtraParams, detectSubFormat, SUB_FORMATS,
   grpcEncode, grpcDecode,
   socks5Greeting, socks5AuthRequest, socks5ConnectRequest, expandIPv6, socks5CheckReply,
-  buildHttpConnectReq, indexOfSeq, chainAllows,
+  buildHttpConnectReq, indexOfSeq, chainAllows, chainNeedsTls,
   clampPort, clampInt,
 } from './_worker.js';
 import { createHash, createCipheriv, createDecipheriv, hkdfSync, randomBytes } from 'node:crypto';
@@ -328,6 +328,14 @@ console.log('[18] SOCKS5 / HTTP 代理握手字节');
   eq('白名单空=全走', chainAllows({ chainWhitelist: [] }, 'x.com'), true);
   eq('白名单命中', chainAllows({ chainWhitelist: ['example.com'] }, 'sub.example.com'), true);
   eq('白名单未命中', chainAllows({ chainWhitelist: ['example.com'] }, 'other.com'), false);
+}
+
+console.log('[19] HTTPS 链式代理判定');
+{
+  ok('https 需要 TLS', chainNeedsTls({ chainType: 'https' }) === true);
+  ok('http 不需要 TLS', chainNeedsTls({ chainType: 'http' }) === false);
+  ok('socks5 不需要 TLS', chainNeedsTls({ chainType: 'socks5' }) === false);
+  ok('空配置不崩', chainNeedsTls(null) === false && chainNeedsTls({}) === false);
 }
 
 console.log(`\n结果：${pass} 通过，${fail} 失败`);

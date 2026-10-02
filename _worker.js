@@ -2463,7 +2463,7 @@ export function adminPageHTML(subPath) {
     srow('🔗', '链式代理', fTgl('chainEnabled'), '开启后出站经由下方的代理服务器') +
     srow('📡', '链式类型', fPills('chainType',
       [['socks5', 'socks5'], ['http', 'http'], ['https', 'https']])) +
-    srow('🖥️', '链式地址', fText('chainHost', '代理服务器域名或 IP')) +
+    srow('🖥️', '链式地址', fText('chainHost', '代理服务器域名或 IP'), 'https 类型请填域名（TLS 证书校验需要）') +
     srow('🔌', '链式端口', fNum('chainPort', '1080')) +
     srow('👤', '链式用户', fText('chainUser', '无认证可留空')) +
     srow('🔑', '链式密码', fPass('chainPass', '')) +
@@ -2960,9 +2960,16 @@ function loonAgg(list) {
  * 拨号顺序：直连 → 链式代理（按配置）→ PROXYIP 回落。
  * 链式代理启用且目标在白名单（白名单为空=全部）时优先走链。
  * ------------------------------------------------------------------ */
-async function tcpConnect(hostname, port) {
+/* 出站 TCP 建连。
+ * secure=true 时让 Workers 在建连阶段直接完成 TLS 握手（含 SNI 与证书校验，
+ * 对应 cloudflare:sockets 的 secureTransport:"on"），返回的已是加密流。
+ * 这是 HTTPS 链式代理的基础：先对代理服务器做 TLS，再在加密隧道里发明文
+ * CONNECT 请求。注意：chainHost 填域名时才能通过证书校验，填 IP 可能失败。 */
+async function tcpConnect(hostname, port, secure) {
   const mod = await import('cloudflare:sockets');
-  return mod.connect({ hostname, port });
+  return secure
+    ? mod.connect({ hostname, port }, { secureTransport: 'on' })
+    : mod.connect({ hostname, port });
 }
 
 /** 白名单判定：空=全部走链；否则目标 host 等于或以任一条目为后缀才走链 */
@@ -3132,15 +3139,19 @@ async function socks5Dial(cfg, targetHost, targetPort) {
   return sock;
 }
 
-/** 经 HTTP/HTTPS 代理 CONNECT 到目标，返回已握手好的 socket */
+/** 链式代理是否需要先对代理服务器做 TLS（https 类型）。
+ * 抽成纯函数：一是单测可覆盖，二是防止以后有人把 https 又当成"不支持"抛错。 */
+export function chainNeedsTls(cfg) {
+  return !!(cfg && cfg.chainType === 'https');
+}
+
+/** 经 HTTP/HTTPS 代理 CONNECT 到目标，返回已握手好的 socket。
+ * chainType=https 时：先 tcpConnect(secure=true) 对代理服务器建 TLS，
+ * 再在 TLS 流里发送明文 CONNECT（HTTPS 代理的标准用法，RFC 2817 思想）。
+ * 之后的数据透传与 http 完全一致，所以握手逻辑复用同一套。 */
 async function httpProxyDial(cfg, targetHost, targetPort) {
-  let sock = await tcpConnect(cfg.chainHost, cfg.chainPort);
-  if (cfg.chainType === 'https') {
-    // 对代理本身先做 TLS（Workers 下用 fetch 做 CONNECT 隧道较复杂，
-    // 这里用原始 TLS：暂不支持，回退为 http 语义并抛错提示）
-    try { sock.close(); } catch { /* 忽略 */ }
-    throw new Error('https 链式代理暂不支持，请用 http 或 socks5');
-  }
+  const useTls = chainNeedsTls(cfg);
+  let sock = await tcpConnect(cfg.chainHost, cfg.chainPort, useTls);
   const w = sock.writable.getWriter();
   const r = sock.readable.getReader();
   try {
