@@ -11,7 +11,15 @@ import {
   parseVlessHeader, parseTrojanHeader, parseUUID, bytesEqual,
   countryFlag, countryNameOf, buildNodeNames,
   buildVlessUri, buildTrojanUri, buildSsUri, buildBase64Sub, buildClashSub, buildSingboxSub,
+  buildSurgeSub, buildQuanxSub, buildLoonSub,
   linesToList, isIP, base64ToBytes, bytesToBase64,
+  parseIPEntry, ipToInt, intToIp, cidrToRange, randomIPsFromCIDRs,
+  extractIPsFromSubText, parseNodeLink, safeDecode,
+  pickHost, subExtraParams, detectSubFormat, SUB_FORMATS,
+  grpcEncode, grpcDecode,
+  socks5Greeting, socks5AuthRequest, socks5ConnectRequest, expandIPv6, socks5CheckReply,
+  buildHttpConnectReq, indexOfSeq, chainAllows,
+  clampPort, clampInt,
 } from './_worker.js';
 import { createHash, createCipheriv, createDecipheriv, hkdfSync, randomBytes } from 'node:crypto';
 
@@ -186,6 +194,141 @@ console.log('[10] 杂项');
 eq('linesToList 去重去空', linesToList('a\n\nb\na\n c '), ['a', 'b', 'c']);
 ok('isIP v4', isIP('1.2.3.4') && !isIP('999.1.1.1'));
 ok('parseUUID 非法 → null', parseUUID('not-a-uuid') === null);
+eq('clampPort 正常', clampPort(8080, 443), 8080);
+eq('clampPort 非法回退', clampPort(99999, 443), 443);
+eq('clampInt 越界钳制', clampInt(999, 0, 500, 16), 500);
+eq('clampInt 非数字回退', clampInt('x', 0, 500, 16), 16);
+
+console.log('[11] 单 IP 条目解析（IP / IP:端口 / IP#备注）');
+eq('裸 IP', parseIPEntry('1.2.3.4'), { ip: '1.2.3.4', port: 0, remark: '' });
+eq('IP:端口', parseIPEntry('1.2.3.4:2053'), { ip: '1.2.3.4', port: 2053, remark: '' });
+eq('IP#备注', parseIPEntry('1.2.3.4#香港专线'), { ip: '1.2.3.4', port: 0, remark: '香港专线' });
+eq('IP:端口#备注', parseIPEntry('1.2.3.4:2096#备注'), { ip: '1.2.3.4', port: 2096, remark: '备注' });
+eq('IPv6 显式', parseIPEntry('[2001:db8::1]:443'), { ip: '2001:db8::1', port: 443, remark: '' });
+eq('裸 IPv6 不拆端口', parseIPEntry('2001:db8::1').ip, '2001:db8::1');
+eq('非法 → null', parseIPEntry('not-an-ip'), null);
+eq('端口越界 → null', parseIPEntry('1.2.3.4:99999'), null);
+
+console.log('[12] CIDR 与随机 IP');
+eq('ipToInt/intToIp 回环', intToIp(ipToInt('104.16.0.1')), '104.16.0.1');
+{
+  const rg = cidrToRange('104.16.0.0/13');
+  eq('cidr 起止', [intToIp(rg.start), intToIp(rg.end)], ['104.16.0.0', '104.23.255.255']);
+  eq('cidr 非法 → null', cidrToRange('xxx'), null);
+  // 确定性随机：序列 rand，保证抽到不同 IP
+  let _s = 0; const seqRand = () => (_s = (_s + 0.37) % 1);
+  const ips = randomIPsFromCIDRs(['104.16.0.0/24'], 2, seqRand);
+  ok('随机 IP 落在段内', ips.length === 2 && ips.every((ip) => ip.startsWith('104.16.0.')));
+  ok('随机 IP 去重', new Set(ips).size === ips.length);
+}
+
+console.log('[13] 订阅文本 IP 提取（sub:// 聚合用）');
+{
+  const v1 = 'vless://11111111-2222-3333-4444-555555555555@9.9.9.9:443?security=tls#US';
+  const v2 = 'trojan://pw@8.8.4.4:443#HK';
+  const b64 = Buffer.from([v1, v2].join('\n')).toString('base64');
+  eq('整段 base64 订阅', extractIPsFromSubText(b64).sort(), ['8.8.4.4', '9.9.9.9']);
+  eq('裸 IP 行', extractIPsFromSubText('1.1.1.1\n2.2.2.2 # 注释'), ['1.1.1.1', '2.2.2.2']);
+  const vmess = 'vmess://' + Buffer.from(JSON.stringify({ add: '7.7.7.7', port: 443, id: 'x' })).toString('base64');
+  eq('vmess add 字段', extractIPsFromSubText(vmess), ['7.7.7.7']);
+}
+
+console.log('[14] 外部节点链接解析（?sub= 聚合用）');
+{
+  const v = parseNodeLink('vless://11111111-2222-3333-4444-555555555555@9.9.9.9:443?security=tls#%E7%BE%8E%E5%9B%BD');
+  eq('vless 解析', [v.proto, v.server, v.port, v.name], ['vless', '9.9.9.9', 443, '美国']);
+  const t = parseNodeLink('trojan://pw@8.8.4.4:8443#HK');
+  eq('trojan 解析', [t.proto, t.server, t.port], ['trojan', '8.8.4.4', 8443]);
+  const up = Buffer.from('aes-128-gcm:mypw').toString('base64');
+  const s = parseNodeLink(`ss://${up}@6.6.6.6:8388#ssnode`);
+  eq('ss 解析', [s.proto, s.method, s.password, s.server], ['ss', 'aes-128-gcm', 'mypw', '6.6.6.6']);
+  eq('非法 → null', parseNodeLink('https://example.com'), null);
+  eq('safeDecode 坏编码不抛', safeDecode('%zz'), '%zz');
+}
+
+console.log('[15] 多 HOST 轮换 / 订阅参数 / 格式识别');
+{
+  const cfg = { hosts: ['a.com', 'b.com'] };
+  eq('pickHost 轮换', [pickHost(cfg, 'x.com', 0), pickHost(cfg, 'x.com', 1), pickHost(cfg, 'x.com', 2)], ['a.com', 'b.com', 'a.com']);
+  eq('pickHost 空 hosts 用请求 host', pickHost({ hosts: [] }, 'x.com', 5), 'x.com');
+  eq('subExtraParams 全开', subExtraParams({ earlyData: true, fragment: true }), '&ed=2048&fragment=1,40-60,30-50,tlshello');
+  eq('subExtraParams 全关', subExtraParams({}), '');
+  const mkReq = (url, ua) => ({ url, headers: new Headers(ua ? { 'user-agent': ua } : {}) });
+  eq('target 参数', detectSubFormat(mkReq('https://x/s?target=surge', ''), null), 'surge');
+  eq('target mixed→base64', detectSubFormat(mkReq('https://x/s?target=mixed', ''), null), 'base64');
+  eq('显式路径优先', detectSubFormat(mkReq('https://x/s?target=surge', ''), 'clash'), 'clash');
+  eq('UA clash', detectSubFormat(mkReq('https://x/s', 'ClashforWindows/1.0'), null), 'clash');
+  eq('UA sing-box', detectSubFormat(mkReq('https://x/s', 'sing-box 1.9'), null), 'singbox');
+  eq('UA surge', detectSubFormat(mkReq('https://x/s', 'Surge iOS/5'), null), 'surge');
+  eq('UA quantumult', detectSubFormat(mkReq('https://x/s', 'Quantumult%20X'), null), 'quanx');
+  eq('UA loon', detectSubFormat(mkReq('https://x/s', 'Loon/3.0'), null), 'loon');
+  eq('默认 base64', detectSubFormat(mkReq('https://x/s', 'curl/8.0'), null), 'base64');
+  ok('SUB_FORMATS 6 种', SUB_FORMATS.length === 6);
+}
+
+console.log('[16] surge / quanx / loon 订阅拼装');
+{
+  const nodes = [{ ip: '1.1.1.1', port: 0, code: 'US', name: '🇺🇸 美国 01' }];
+  const cfg = { UUID: '123e4567-e89b-12d3-a456-426614174000', trojanPassword: 'tpw', ssPassword: 'spw', ssMethod: 'aes-128-gcm', nodePort: 443, hosts: [] };
+  const host = 'example.workers.dev';
+  const surge = buildSurgeSub(nodes, cfg, host);
+  ok('surge 含 vless 行', surge.includes('= vless, 1.1.1.1, 443, username='));
+  ok('surge 含 Proxy Group', surge.includes('[Proxy Group]'));
+  const qx = buildQuanxSub(nodes, cfg, host);
+  ok('quanx vless 行', qx.includes('vless=1.1.1.1:443, method=none'));
+  ok('quanx trojan 行', qx.includes('trojan=1.1.1.1:443, password=tpw'));
+  const loon = buildLoonSub(nodes, cfg, host);
+  ok('loon VLESS 行', loon.includes('= VLESS,1.1.1.1,443,'));
+  // 单 IP 端口覆盖
+  const n2 = [{ ip: '2.2.2.2', port: 2053, code: 'HK', name: '🇭🇰 香港 01' }];
+  ok('单 IP 端口进 surge', buildSurgeSub(n2, cfg, host).includes('2.2.2.2, 2053'));
+  // 多 HOST 轮换进订阅
+  const cfg2 = { ...cfg, hosts: ['h1.com', 'h2.com'] };
+  const qx2 = buildQuanxSub([...nodes, ...n2], cfg2, host);
+  ok('多 HOST 轮换', qx2.includes('sni=h1.com') && qx2.includes('sni=h2.com'));
+}
+
+console.log('[17] gRPC 帧编解码');
+{
+  const p1 = new TextEncoder().encode('hello');
+  const p2 = new TextEncoder().encode('world!');
+  const enc = grpcEncode([p1, p2]);
+  eq('帧头', [...enc.subarray(0, 5)], [0, 0, 0, 0, 5]);
+  const { frames, rest } = grpcDecode(enc);
+  eq('解出 2 帧', frames.length, 2);
+  eq('帧内容', new TextDecoder().decode(Buffer.concat(frames.map((f) => Buffer.from(f)))), 'helloworld!');
+  eq('无尾巴', rest.length, 0);
+  const partial = enc.subarray(0, 7);
+  const d2 = grpcDecode(partial);
+  eq('不完整帧 → 等待', [d2.frames.length, d2.rest.length], [0, 7]);
+  const bad = new Uint8Array([0, 255, 255, 255, 255]);
+  eq('非法长度 → 停', grpcDecode(bad).frames.length, 0);
+}
+
+console.log('[18] SOCKS5 / HTTP 代理握手字节');
+{
+  eq('greeting 无认证', [...socks5Greeting(false)], [5, 1, 0]);
+  eq('greeting 有认证', [...socks5Greeting(true)], [5, 2, 0, 2]);
+  const auth = socks5AuthRequest('u', 'p');
+  eq('auth 包头', [auth[0], auth[1], auth[3]], [1, 1, 1]);
+  const cr = socks5ConnectRequest('example.com', 443);
+  eq('connect 域名', [cr[0], cr[1], cr[2], cr[3], cr[4]], [5, 1, 0, 3, 11]);
+  eq('connect 端口', [cr[cr.length - 2], cr[cr.length - 1]], [1, 187]);
+  const cr4 = socks5ConnectRequest('1.2.3.4', 80);
+  eq('connect IPv4', [...cr4.subarray(0, 8)], [5, 1, 0, 1, 1, 2, 3, 4]);
+  ok('checkReply 通过', socks5CheckReply(new Uint8Array([5, 0]), 2));
+  ok('checkReply 拒绝', !socks5CheckReply(new Uint8Array([5, 2]), 2));
+  const v6 = expandIPv6('2001:db8::1');
+  eq('IPv6 展开长度', v6.length, 16);
+  eq('IPv6 首尾', [v6[0], v6[1], v6[14], v6[15]], [0x20, 0x01, 0, 1]);
+  const hc = buildHttpConnectReq('a.com', 443, 'u', 'p');
+  ok('http connect 含认证头', hc.startsWith('CONNECT a.com:443 HTTP/1.1') && hc.includes('Proxy-Authorization: Basic '));
+  eq('indexOfSeq 找到', indexOfSeq(new Uint8Array([1, 2, 13, 10, 3]), new Uint8Array([13, 10])), 2);
+  eq('indexOfSeq 未找到', indexOfSeq(new Uint8Array([1, 2, 3]), new Uint8Array([9])), -1);
+  eq('白名单空=全走', chainAllows({ chainWhitelist: [] }, 'x.com'), true);
+  eq('白名单命中', chainAllows({ chainWhitelist: ['example.com'] }, 'sub.example.com'), true);
+  eq('白名单未命中', chainAllows({ chainWhitelist: ['example.com'] }, 'other.com'), false);
+}
 
 console.log(`\n结果：${pass} 通过，${fail} 失败`);
 process.exit(fail ? 1 : 0);
