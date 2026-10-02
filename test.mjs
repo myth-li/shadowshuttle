@@ -16,7 +16,7 @@ import {
   parseIPEntry, ipToInt, intToIp, cidrToRange, randomIPsFromCIDRs,
   extractIPsFromSubText, parseNodeLink, safeDecode,
   pickHost, subExtraParams, detectSubFormat, SUB_FORMATS,
-  grpcEncode, grpcDecode,
+  grpcEncode, grpcDecode, grpcEncodeTrailer,
   socks5Greeting, socks5AuthRequest, socks5ConnectRequest, expandIPv6, socks5CheckReply,
   buildHttpConnectReq, indexOfSeq, chainAllows, chainNeedsTls,
   buildDialPlan, computeDialTimeout, raceDials,
@@ -372,6 +372,20 @@ console.log('[20] 拨号计划 / 自适应超时 / 并发竞速');
   let threw2 = false;
   try { await raceDials([slow], 30); } catch (e) { threw2 = /timeout/.test(e.message); }
   ok('超时抛错', threw2);
+}
+
+console.log('[21] gRPC trailer 帧');
+{
+  const tr = grpcEncodeTrailer(0, '');
+  eq('trailer 标志位', tr[0], 0x80);
+  const len = (tr[1] << 24) | (tr[2] << 16) | (tr[3] << 8) | tr[4];
+  eq('trailer 长度字段', len, tr.length - 5);
+  const dec = grpcDecode(tr);
+  eq('trailer 可被解帧', dec.frames.length, 1);
+  const body = new TextDecoder().decode(dec.frames[0]);
+  ok('trailer 含 grpc-status:0', body.includes('grpc-status:0'));
+  const tr2 = grpcEncodeTrailer(13, 'boom');
+  ok('trailer 非零状态', new TextDecoder().decode(grpcDecode(tr2).frames[0]).includes('grpc-status:13'));
 }
 
 console.log(`\n结果：${pass} 通过，${fail} 失败`);

@@ -3572,8 +3572,8 @@ async function handleSs(server, request, env, cfg) {
  * 帧格式参考 gRPC HTTP/2 Length-Prefixed-Message：
  *   1B 压缩标志（0=未压缩）+ 4B 大端长度 + 载荷
  * 首帧载荷按 VLESS 解析（失败再试 Trojan）；仅支持 TCP，UDP 拒绝。
- * 回包逐帧封装；HTTP/1 下 trailers 无法流式发送，这里把 grpc-status
- * 放在响应头（多数 gun 客户端可接受），已知限制见 CHANGELOG。
+ * 回包逐帧封装；流结束时补 trailer 帧（grpc-status:0，首字节 0x80），
+ * 严格 gRPC 客户端靠它确认 RPC 正常完成；响应头也带 grpc-status 兼容 HTTP/1 客户端。
  * ------------------------------------------------------------------ */
 
 /** gRPC 编码：一组载荷 → Length-Prefixed-Message 字节流 */
@@ -3611,6 +3611,24 @@ export function grpcDecode(buf) {
     o += 5 + len;
   }
   return { frames, rest: buf.subarray(o) };
+}
+
+/** gRPC trailer 帧编码（纯函数）。
+ * 为什么需要：标准 gRPC 客户端在流结束时期望收到 trailer 帧（首字节最高位
+ * 0x80 置位，载荷为 "grpc-status:0\r\n" 等 ASCII 头），用它确认一次 RPC 正常
+ * 结束；收不到时部分严格客户端会判定流异常中断而不断重试。v2 只把 grpc-status
+ * 放在 HTTP 响应头里，HTTP/1 下多数 gun 客户端能接受，但严格客户端会断连；
+ * v3 在数据流末尾补一个 trailer 帧，两者兼顾。 */
+export function grpcEncodeTrailer(status, message) {
+  const payload = te.encode(`grpc-status:${status}\r\ngrpc-message:${message || ''}\r\n`);
+  const out = new Uint8Array(5 + payload.length);
+  out[0] = 0x80; // trailer 标志位（压缩标志的最高位）
+  out[1] = (payload.length >>> 24) & 255;
+  out[2] = (payload.length >>> 16) & 255;
+  out[3] = (payload.length >>> 8) & 255;
+  out[4] = payload.length & 255;
+  out.set(payload, 5);
+  return out;
 }
 
 /** gRPC 错误响应（HTTP 200 + grpc-status 非零，客户端按 gRPC 语义处理） */
@@ -3688,7 +3706,11 @@ async function handleGrpc(request, env, cfg, ctx) {
             if (value && value.length) ctrl.enqueue(grpcEncode([value]));
           }
         } catch { /* 忽略 */ }
-        try { ctrl.close(); } catch { /* 忽略 */ }
+        try {
+          // 流正常结束：补 trailer 帧（grpc-status:0），严格客户端靠它确认 RPC 完成
+          ctrl.enqueue(grpcEncodeTrailer(0, ''));
+          ctrl.close();
+        } catch { /* 忽略 */ }
         try { sockReader.cancel(); } catch { /* 忽略 */ }
       },
       cancel() { try { sockReader.cancel(); } catch { /* 忽略 */ } },
@@ -3705,7 +3727,15 @@ async function handleGrpc(request, env, cfg, ctx) {
  * 识别：POST +（x-padding 请求头 或 ?xhttp= 查询参数），/api/* 除外。
  * stream-one：整个上行流在一个 POST body 里，原始字节流（无帧封装），
  * 首段按 VLESS/Trojan 解析目标地址，之后透传；回包原始流。
- * （packet-up 等多请求拆分模式暂不支持，见 CHANGELOG）
+ *
+ * 为什么不支持 stream-up / packet-up（v3 结论，保持 stream-one）：
+ * 这两种模式把一次代理会话拆成多个 HTTP 请求（上行 POST、下行 GET 长轮询，
+ * 靠 session id 配对），要求服务端在"上行请求"和"下行请求"之间共享会话状态
+ * 且延迟要低。Cloudflare Workers 的 isolate 是无状态的（同用户两次请求大
+ * 概率落到不同 isolate，内存 Map 共享不可靠），唯一跨请求存储是 KV，而 KV
+ * 是最终一致性、读写几十毫秒——拿它做逐包的上下行配对既不可靠又慢。
+ * stream-one 把上下行收敛在一次请求里，无需跨请求状态，是 Workers 下唯一
+ * 稳妥的 XHTTP 形态；客户端用 auto 模式会自动协商到 stream-one。
  * ------------------------------------------------------------------ */
 
 /** XHTTP 建连：body 原始流 → 协议解析 → TCP 出站 → 原始流回包 */
