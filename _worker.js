@@ -1,18 +1,30 @@
 /**
  * 影梭 ShadowShuttle — 自研 Cloudflare Worker 代理
  * ============================================================
- * clean-room 实现：VLESS / Trojan / Shadowsocks over WebSocket，
- * 优选 IP 订阅生成（国旗+中文国名+序号命名），现代简约管理面板。
+ * clean-room 实现，未复制任何现有项目的代码，只参考公开协议规范
+ * （VLESS/Trojan/Shadowsocks 协议头、RFC 8439、gRPC framing、SOCKS5 RFC 1928）。
  *
- * 参考的只是公开协议规范（VLESS 协议头格式、Trojan 协议、
- * Shadowsocks AEAD、RFC 8439 ChaCha20-Poly1305），未复制任何
- * 现有项目的代码。
+ * 【功能索引】
+ * 一、代理协议：VLESS / Trojan / Shadowsocks over WebSocket（首包自动识别）
+ * 二、传输方式：WebSocket、gRPC（POST+application/grpc）、XHTTP（stream-one 基础模式）
+ * 三、订阅：base64 通用 / Clash / sing-box / Surge / Quantumult X / Loon，
+ *     ?target= 指定格式，UA 自动识别；多 HOST 轮换；/{KEY} 快速订阅；
+ *     ?sub= 聚合外部订阅；sub:// 优选源聚合
+ * 四、优选 IP：静态列表（IP / IP:端口 / IP#备注）+ URL 文本源 + sub:// 聚合源
+ *     + 内置随机生成器（默认 16 个）；归属地查询 + KV 缓存 30 天
+ * 五、节点命名：{国旗emoji}{中文国名} {全局序号}，如 🇺🇸 美国 01
+ * 六、出站：直连 → 链式代理（SOCKS5/HTTP/HTTPS，可配白名单）→ PROXYIP 回落
+ * 七、订阅参数：0RTT（ed）、TLS 分片（fragment）开关；SS 非 TLS 备用端口
+ * 八、管理面板：登录会话、配置读写、请求日志查看、优选源一键验证、
+ *     链式代理检查、CF 用量查询、TG 推送配置；深色模式；二维码；3 步引导
+ * 九、日志与通知：KV 请求日志（可开关）；TG 推送（拉订阅/新 IP 建连）
  *
  * 部署：把整个文件粘贴到 Cloudflare Dashboard → Workers → 编辑代码，
  * 或用 wrangler deploy。纯逻辑函数同时 export，供 node 自测。
+ * 版本变更记录见仓库根目录 CHANGELOG.md。
  */
 
-export const SS_VERSION = '1.0.0';
+export const SS_VERSION = '2.0.0';
 
 /* ------------------------------------------------------------------
  * 国家代码 → 中文国名映射表（ISO 3166-1 alpha-2）
@@ -167,6 +179,79 @@ export function isIP(s) {
     return t.split('.').every((p) => Number(p) >= 0 && Number(p) <= 255);
   }
   return /^[0-9a-fA-F:]{2,45}$/.test(t) && t.includes(':');
+}
+
+/** 解析单条优选 IP 条目，支持四种写法：
+ *  1.2.3.4 / 1.2.3.4:2053 / 1.2.3.4#备注 / [2001:db8::1]:2053#备注
+ *  返回 {ip, port(0=用默认), remark}，非法返回 null。 */
+export function parseIPEntry(s) {
+  let t = String(s || '').trim();
+  if (!t) return null;
+  let remark = '';
+  const hi = t.indexOf('#');
+  if (hi >= 0) { remark = t.slice(hi + 1).trim(); t = t.slice(0, hi).trim(); }
+  let ip = t, port = 0;
+  if (t.startsWith('[')) {
+    // IPv6 显式写法：[2001:db8::1]:2053
+    const m = t.match(/^\[([^\]]+)\](?::(\d+))?$/);
+    if (!m) return null;
+    ip = m[1];
+    port = m[2] ? Number(m[2]) : 0;
+  } else {
+    // IPv4 带端口：恰好一个冒号且后半是纯数字；裸 IPv6 不拆端口
+    const parts = t.split(':');
+    if (parts.length === 2 && /^\d+$/.test(parts[1]) && isIP(parts[0])) {
+      ip = parts[0];
+      port = Number(parts[1]);
+    } else {
+      ip = t;
+    }
+  }
+  if (!isIP(ip)) return null;
+  if (port && !(port > 0 && port < 65536)) return null;
+  return { ip, port, remark };
+}
+
+/** IPv4 点分 → uint32 */
+export function ipToInt(ip) {
+  const p = ip.split('.').map(Number);
+  return ((p[0] * 256 + p[1]) * 256 + p[2]) * 256 + p[3];
+}
+
+/** uint32 → IPv4 点分 */
+export function intToIp(n) {
+  n = n >>> 0;
+  return [(n >>> 24) & 255, (n >>> 16) & 255, (n >>> 8) & 255, n & 255].join('.');
+}
+
+/** CIDR → {start, end}（uint32 区间，仅 IPv4；非法返回 null） */
+export function cidrToRange(cidr) {
+  const m = String(cidr || '').trim().match(/^(\d{1,3}(?:\.\d{1,3}){3})\/(\d{1,2})$/);
+  if (!m || !isIP(m[1])) return null;
+  const bits = Number(m[2]);
+  if (bits < 0 || bits > 32) return null;
+  const base = ipToInt(m[1]);
+  const size = Math.pow(2, 32 - bits);
+  const start = Math.floor(base / size) * size;
+  return { start, end: start + size - 1 };
+}
+
+/** 从 CIDR 列表随机抽取 count 个 IPv4（rand 可注入，便于单测） */
+export function randomIPsFromCIDRs(cidrs, count, rand) {
+  const r = rand || Math.random;
+  const ranges = [];
+  for (const c of cidrs || []) {
+    const rg = cidrToRange(c);
+    if (rg && rg.end > rg.start) ranges.push(rg);
+  }
+  const out = new Set();
+  let guard = count * 50 + 100; // 防止极端情况下死循环
+  while (out.size < count && guard-- > 0 && ranges.length) {
+    const rg = ranges[Math.floor(r() * ranges.length)];
+    const n = rg.start + 1 + Math.floor(r() * (rg.end - rg.start - 1));
+    out.add(intToIp(n));
+  }
+  return [...out];
 }
 
 /* ------------------------------------------------------------------
@@ -616,16 +701,46 @@ const KV_CONFIG_KEY = 'ss:config';
 const KV_SESSION_PREFIX = 'ss:session:';
 const KV_GEO_PREFIX = 'ss:geo:';
 const KV_SRC_PREFIX = 'ss:src:';
+const KV_CIDR_KEY = 'ss:cf-cidrs';   // Cloudflare IP 段缓存（24 小时）
+const KV_LOG_KEY = 'ss:log';         // 请求日志（JSON 数组，最多 200 条）
+const KV_TGIP_PREFIX = 'ss:tg:';     // TG 建连通知去重（每 IP 每天一次）
 
 const DEFAULT_CONFIG = {
+  // —— 用户与协议 ——
   multiUUID: [],            // 多用户 UUID 数组
   trojanPassword: '',       // Trojan 密码（空=不启用）
   ssPassword: '',           // SS 密码（空=不启用）
   ssMethod: 'aes-128-gcm',  // SS 加密方式
-  preferredSources: [],     // 优选 IP 源 URL 列表
-  preferredStatic: [],      // 静态优选 IP 列表
-  proxyIP: '',              // 回落 IP（出站失败时重试）
+  ssAltPort: 0,             // SS 非 TLS 备用端口（0=关闭，如 80）
+  // —— 订阅 ——
+  subKey: '',               // 快速订阅路径 KEY（空=不启用），/{KEY} 直达订阅
+  hosts: [],                // 多 HOST 轮换（空=用请求 host）
   nodePort: 443,            // 节点端口
+  earlyData: false,         // 0RTT：订阅拼 ed=2048 参数
+  fragment: false,          // TLS 分片：订阅拼 fragment 参数（需客户端支持）
+  // —— 优选 IP ——
+  preferredSources: [],     // 优选 IP 源 URL 列表（支持 https:// 文本源与 sub:// 聚合源）
+  preferredStatic: [],      // 静态优选 IP 列表（支持 IP / IP:端口 / IP#备注）
+  randIPCount: 16,          // 内置随机优选 IP 生成数量（0=关闭）
+  randIPPort: 443,          // 随机优选 IP 端口
+  // —— 出站 ——
+  proxyIP: '',              // 回落 IP（出站失败时重试）
+  chainEnabled: false,      // 链式代理开关
+  chainType: 'socks5',      // socks5 / http / https
+  chainHost: '',            // 链式代理地址
+  chainPort: 1080,          // 链式代理端口
+  chainUser: '',            // 链式代理账号（可空）
+  chainPass: '',            // 链式代理密码（可空）
+  chainWhitelist: [],       // 域名白名单（空=全部走链；否则仅名单内走链）
+  // —— 日志与通知 ——
+  logEnabled: false,        // KV 请求日志开关
+  tgEnabled: false,         // Telegram 推送开关
+  tgBotToken: '',           // TG Bot Token
+  tgChatId: '',             // TG Chat ID
+  // —— Cloudflare ——
+  cfApiToken: '',           // CF API Token（用量查询）
+  cfAccountId: '',          // CF Account ID（用量查询）
+  // —— 其他 ——
   disguiseHTML: '',         // 伪装首页（空=内置默认）
   subPath: '',              // 订阅路径（空=/{SUB_TOKEN}）
 };
@@ -634,6 +749,19 @@ const DEFAULT_CONFIG = {
 export function linesToList(s) {
   if (Array.isArray(s)) return [...new Set(s.map((x) => String(x).trim()).filter(Boolean))];
   return [...new Set(String(s || '').split('\n').map((x) => x.trim()).filter(Boolean))];
+}
+
+/** 端口钳制：非法时回退默认值 */
+export function clampPort(v, def) {
+  const n = Number(v);
+  return n > 0 && n < 65536 ? Math.floor(n) : def;
+}
+
+/** 整数钳制到 [min, max]，非法时回退默认值 */
+export function clampInt(v, min, max, def) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return def;
+  return Math.min(max, Math.max(min, Math.floor(n)));
 }
 
 /** 读取合并后的配置：KV > 默认值；ADMIN/UUID/SUB_TOKEN 只从 env 取 */
@@ -653,9 +781,23 @@ export async function loadConfig(env) {
   }
   cfg.multiUUID = linesToList(cfg.multiUUID);
   cfg.preferredSources = linesToList(cfg.preferredSources);
-  cfg.preferredStatic = linesToList(cfg.preferredStatic).filter(isIP);
-  cfg.nodePort = Number(cfg.nodePort) > 0 && Number(cfg.nodePort) < 65536 ? Number(cfg.nodePort) : 443;
+  // 静态优选 IP：保留原始条目文本（支持 IP / IP:端口 / IP#备注），解析在 getPreferredIPs 做
+  cfg.preferredStatic = linesToList(cfg.preferredStatic);
+  cfg.hosts = linesToList(cfg.hosts);
+  cfg.chainWhitelist = linesToList(cfg.chainWhitelist);
+  cfg.nodePort = clampPort(cfg.nodePort, 443);
+  cfg.randIPPort = clampPort(cfg.randIPPort, 443);
+  cfg.randIPCount = clampInt(cfg.randIPCount, 0, 500, 16);
+  cfg.ssAltPort = clampInt(cfg.ssAltPort, 0, 65535, 0);
+  cfg.chainPort = clampPort(cfg.chainPort, 1080);
   if (!SS_METHODS[cfg.ssMethod]) cfg.ssMethod = 'aes-128-gcm';
+  if (!['socks5', 'http', 'https'].includes(cfg.chainType)) cfg.chainType = 'socks5';
+  cfg.subKey = String(cfg.subKey || '').trim().replace(/^\/+|\/+$/g, '');
+  cfg.earlyData = !!cfg.earlyData;
+  cfg.fragment = !!cfg.fragment;
+  cfg.chainEnabled = !!cfg.chainEnabled;
+  cfg.logEnabled = !!cfg.logEnabled;
+  cfg.tgEnabled = !!cfg.tgEnabled;
   // env 兜底
   cfg.ADMIN = env.ADMIN || '';
   cfg.UUID = env.UUID || '';
@@ -666,19 +808,55 @@ export async function loadConfig(env) {
   return cfg;
 }
 
-/** 校验并保存配置到 KV（只接受白名单字段） */
+/** 校验并保存配置到 KV（只接受白名单字段）。
+ *  密码类字段（chainPass/tgBotToken/cfApiToken/ssPassword）留空表示不修改：
+ *  先读出现有配置做合并，避免前端不回显导致每次保存被清空。 */
 export async function saveConfig(env, input) {
   const kv = env.KV;
   if (!kv) throw new Error('KV 未绑定');
+  // 读出现有配置，用于密码留空时保留旧值
+  let old = {};
+  try {
+    const raw = await kv.get(KV_CONFIG_KEY);
+    if (raw) old = JSON.parse(raw);
+  } catch { /* 忽略 */ }
+  // 留空=不修改的密码类字段：先填回旧值再走统一校验
+  const keepIfEmpty = (k) => {
+    if (input[k] === undefined || String(input[k]) === '') input[k] = old[k] || '';
+  };
+  keepIfEmpty('ssPassword');
+  keepIfEmpty('chainPass');
+  keepIfEmpty('tgBotToken');
+  keepIfEmpty('cfApiToken');
   const cfg = { ...DEFAULT_CONFIG };
   cfg.multiUUID = linesToList(input.multiUUID).filter((s) => parseUUID(s));
   cfg.trojanPassword = String(input.trojanPassword || '').trim();
   cfg.ssPassword = String(input.ssPassword || '');
   cfg.ssMethod = SS_METHODS[input.ssMethod] ? input.ssMethod : 'aes-128-gcm';
-  cfg.preferredSources = linesToList(input.preferredSources).filter((s) => /^https?:\/\//.test(s));
-  cfg.preferredStatic = linesToList(input.preferredStatic).filter(isIP);
+  cfg.ssAltPort = clampInt(input.ssAltPort, 0, 65535, 0);
+  cfg.subKey = String(input.subKey || '').trim().replace(/^\/+|\/+$/g, '');
+  cfg.hosts = linesToList(input.hosts);
+  cfg.nodePort = clampPort(input.nodePort, 443);
+  cfg.earlyData = !!input.earlyData;
+  cfg.fragment = !!input.fragment;
+  cfg.preferredSources = linesToList(input.preferredSources).filter((s) => /^(https?|sub):\/\//.test(s));
+  cfg.preferredStatic = linesToList(input.preferredStatic);
+  cfg.randIPCount = clampInt(input.randIPCount, 0, 500, 16);
+  cfg.randIPPort = clampPort(input.randIPPort, 443);
   cfg.proxyIP = isIP(String(input.proxyIP || '').trim()) ? String(input.proxyIP).trim() : '';
-  cfg.nodePort = Number(input.nodePort) > 0 && Number(input.nodePort) < 65536 ? Number(input.nodePort) : 443;
+  cfg.chainEnabled = !!input.chainEnabled;
+  cfg.chainType = ['socks5', 'http', 'https'].includes(input.chainType) ? input.chainType : 'socks5';
+  cfg.chainHost = String(input.chainHost || '').trim();
+  cfg.chainPort = clampPort(input.chainPort, 1080);
+  cfg.chainUser = String(input.chainUser || '');
+  cfg.chainPass = String(input.chainPass || '');
+  cfg.chainWhitelist = linesToList(input.chainWhitelist);
+  cfg.logEnabled = !!input.logEnabled;
+  cfg.tgEnabled = !!input.tgEnabled;
+  cfg.tgBotToken = String(input.tgBotToken || '').trim();
+  cfg.tgChatId = String(input.tgChatId || '').trim();
+  cfg.cfApiToken = String(input.cfApiToken || '').trim();
+  cfg.cfAccountId = String(input.cfAccountId || '').trim();
   cfg.disguiseHTML = String(input.disguiseHTML || '');
   const sp = String(input.subPath || '').trim();
   cfg.subPath = sp ? (sp.startsWith('/') ? sp : '/' + sp) : '';
@@ -687,7 +865,13 @@ export async function saveConfig(env, input) {
 }
 
 /* ------------------------------------------------------------------
- * 优选 IP 获取：静态列表 + 源 URL 抓取（KV 缓存 6 小时），去重
+ * 优选 IP 获取（v2）
+ * 数据来源（按顺序合并，按 IP 去重，首个出现的条目保留端口/备注）：
+ *  1. 静态列表：支持 IP / IP:端口 / IP#备注 / [IPv6]:端口#备注
+ *  2. URL 源：https:// 文本源（每行一个 IP，KV 缓存 6 小时）
+ *  3. sub:// 聚合源：拉取外部订阅，提取其中的节点 IP
+ *  4. 内置随机生成器：从 Cloudflare 公开 IP 段随机抽取（默认 16 个）
+ * 返回条目数组 [{ip, port(0=用默认), remark}]。
  * ------------------------------------------------------------------ */
 function sha256HexSync(s) {
   // 非加密用途的短哈希：用 FNV-1a 做缓存 key（避免 async）
@@ -697,6 +881,37 @@ function sha256HexSync(s) {
   return (h1 >>> 0).toString(16).padStart(8, '0');
 }
 
+/** 从订阅文本提取 IP：支持整段 base64、vless/trojan/ss/vmess 链接、裸 IP 行 */
+export function extractIPsFromSubText(text) {
+  const ips = new Set();
+  let t = String(text || '').trim();
+  if (!t) return [];
+  // 整段无 "://" 且像 base64：先解码一次
+  if (!t.includes('://') && /^[A-Za-z0-9+/=\r\n\s]+$/.test(t) && t.replace(/\s+/g, '').length % 4 === 0) {
+    try { t = td.decode(base64ToBytes(t.replace(/\s+/g, ''))); } catch { /* 不是 base64，按原文处理 */ }
+  }
+  for (const rawLine of t.split('\n')) {
+    const s = rawLine.trim();
+    if (!s) continue;
+    // vmess://BASE64(JSON) → 取 add 字段
+    if (s.startsWith('vmess://')) {
+      try {
+        const j = JSON.parse(td.decode(base64ToBytes(s.slice(8).trim())));
+        if (j && isIP(j.add)) ips.add(String(j.add).trim());
+      } catch { /* 忽略坏行 */ }
+      continue;
+    }
+    // 协议链接：取 @ 后面的 host（ss 的 userinfo 是 base64，无 @ 时跳过）
+    const m = s.match(/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\/[^@\s]*@([^:/?#\s]+)/);
+    if (m && isIP(m[1])) { ips.add(m[1]); continue; }
+    // 裸 IP 行（顺手支持 IP:端口 / IP#备注写法，只取 IP）
+    const e = parseIPEntry(s.split(/\s+/)[0]);
+    if (e) ips.add(e.ip);
+  }
+  return [...ips];
+}
+
+/** 抓取单个优选源（https 文本源 或 sub:// 聚合源），返回去重 IP 数组 */
 async function fetchSourceIPs(url, kv) {
   const cacheKey = KV_SRC_PREFIX + sha256HexSync(url);
   if (kv) {
@@ -710,15 +925,21 @@ async function fetchSourceIPs(url, kv) {
   }
   const ips = [];
   try {
+    // sub:// 开头：去掉前缀后按普通 URL 拉取
+    const realUrl = url.startsWith('sub://') ? url.slice(6) : url;
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), 15000);
-    const res = await fetch(url, { signal: ctrl.signal });
+    const res = await fetch(realUrl, { signal: ctrl.signal });
     clearTimeout(timer);
     if (res.ok) {
       const text = await res.text();
-      for (const line of text.split('\n')) {
-        const ip = line.trim().split(/[\s,#;]+/)[0];
-        if (ip && isIP(ip)) ips.push(ip);
+      if (url.startsWith('sub://')) {
+        ips.push(...extractIPsFromSubText(text));
+      } else {
+        for (const line of text.split('\n')) {
+          const e = parseIPEntry(line.trim().split(/[\s;]+/)[0]);
+          if (e) ips.push(e.ip);
+        }
       }
     }
   } catch { /* 单个源失败不影响整体 */ }
@@ -729,13 +950,77 @@ async function fetchSourceIPs(url, kv) {
   return uniq;
 }
 
-/** 全部优选 IP（去重）：静态 + 各源抓取 */
-export async function getPreferredIPs(cfg, env) {
-  const all = [...cfg.preferredStatic];
+/** 内嵌兜底的 Cloudflare IPv4 段（官方会变，优先拉取在线列表） */
+const CF_CIDR_FALLBACK = [
+  '173.245.48.0/20', '103.21.244.0/22', '103.22.200.0/22', '103.31.4.0/22',
+  '141.101.64.0/18', '108.162.192.0/18', '190.93.240.0/20', '188.114.96.0/20',
+  '197.234.240.0/22', '198.41.128.0/17', '162.158.0.0/15', '104.16.0.0/13',
+  '104.24.0.0/14', '172.64.0.0/13', '131.0.72.0/22',
+];
+
+/** 取 Cloudflare 公开 IPv4 段：KV 缓存 24 小时 → 在线拉取 → 内嵌兜底 */
+async function getCloudflareCIDRs(env) {
   const kv = env.KV;
-  const results = await Promise.all(cfg.preferredSources.map((u) => fetchSourceIPs(u, kv)));
-  for (const ips of results) all.push(...ips);
-  return [...new Set(all)];
+  if (kv) {
+    try {
+      const cached = await kv.get(KV_CIDR_KEY);
+      if (cached) {
+        const { ts, cidrs } = JSON.parse(cached);
+        if (Date.now() - ts < 24 * 3600 * 1000 && cidrs && cidrs.length) return cidrs;
+      }
+    } catch { /* 忽略 */ }
+  }
+  let cidrs = [];
+  try {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 10000);
+    const res = await fetch('https://www.cloudflare.com/ips-v4', { signal: ctrl.signal });
+    clearTimeout(timer);
+    if (res.ok) {
+      for (const line of (await res.text()).split('\n')) {
+        if (cidrToRange(line.trim())) cidrs.push(line.trim());
+      }
+    }
+  } catch { /* 拉取失败用兜底 */ }
+  if (!cidrs.length) cidrs = [...CF_CIDR_FALLBACK];
+  if (kv) {
+    try { await kv.put(KV_CIDR_KEY, JSON.stringify({ ts: Date.now(), cidrs }), { expirationTtl: 24 * 3600 }); } catch { /* 忽略 */ }
+  }
+  return cidrs;
+}
+
+/** 内置随机优选 IP 生成器：从 CF 段随机抽 count 个 */
+export async function genRandomPreferredIPs(count, env, rand) {
+  if (!count || count <= 0) return [];
+  const cidrs = await getCloudflareCIDRs(env);
+  return randomIPsFromCIDRs(cidrs, Math.min(count, 500), rand);
+}
+
+/** 全部优选 IP 条目（去重）：静态 + 各源抓取 + 随机生成。
+ *  返回 [{ip, port, remark}]，port 为 0 表示用节点默认端口。 */
+export async function getPreferredIPs(cfg, env) {
+  const seen = new Set();
+  const out = [];
+  const push = (ip, port, remark) => {
+    if (!ip || seen.has(ip)) return;
+    seen.add(ip);
+    out.push({ ip, port: port || 0, remark: remark || '' });
+  };
+  // 1. 静态列表（支持端口与备注）
+  for (const s of cfg.preferredStatic || []) {
+    const e = parseIPEntry(s);
+    if (e) push(e.ip, e.port, e.remark);
+  }
+  // 2/3. URL 源（含 sub:// 聚合源）
+  const kv = env.KV;
+  const results = await Promise.all((cfg.preferredSources || []).map((u) => fetchSourceIPs(u, kv)));
+  for (const ips of results) for (const ip of ips) push(ip, 0, '');
+  // 4. 随机生成
+  if (cfg.randIPCount > 0) {
+    const rnd = await genRandomPreferredIPs(cfg.randIPCount, env);
+    for (const ip of rnd) push(ip, cfg.randIPPort || 0, '');
+  }
+  return out;
 }
 
 /* ------------------------------------------------------------------
@@ -788,12 +1073,17 @@ export async function refreshGeoCache(ips, env) {
 
 /* ------------------------------------------------------------------
  * 订阅节点组装
- * 命名：{国旗emoji}{中文国名} {全局序号}，如 🇺🇸 美国 01
+ * 命名：{国旗emoji}{中文国名} {全局序号}，如 🇺🇸 美国 01；
+ * 条目带 #备注 时追加在末尾，如 🇺🇸 美国 01 香港专线。
  * 排序：按国家代码分组，组内按 IP 排序，组按代码排序；全局编号 01..NN
  * 每个 IP 生成 VLESS / Trojan / SS 各一条（按配置启用的协议）
+ * 输入兼容旧格式的字符串数组（自动转为条目）。
  * ------------------------------------------------------------------ */
-export function buildNodeNames(ips, geoMap) {
-  const items = ips.map((ip) => ({ ip, code: geoMap[ip] || '??' }));
+export function buildNodeNames(entries, geoMap) {
+  const items = (entries || []).map((e) => {
+    const en = typeof e === 'string' ? { ip: e, port: 0, remark: '' } : e;
+    return { ip: en.ip, port: en.port || 0, remark: en.remark || '', code: (geoMap || {})[en.ip] || '??' };
+  });
   // 按国家代码排序，未知归属地（'??'）排在最后；同国家内按 IP 排；最后全局编号 01..NN
   items.sort((a, b) => {
     const au = a.code === '??', bu = b.code === '??';
@@ -806,34 +1096,66 @@ export function buildNodeNames(ips, geoMap) {
     const flag = known ? countryFlag(it.code) : '🌐';
     const name = known ? countryNameOf(it.code) : '未知';
     const num = String(i + 1).padStart(2, '0');
-    return { ip: it.ip, code: it.code, name: `${flag} ${name} ${num}` };
+    const full = `${flag} ${name} ${num}` + (it.remark ? ` ${it.remark}` : '');
+    return { ip: it.ip, port: it.port, code: it.code, name: full };
   });
 }
 
-export function buildVlessUri(node, uuid, port, host) {
-  const params = `encryption=none&security=tls&sni=${host}&fp=chrome&type=ws&host=${host}&path=%2F${uuid}`;
-  return `vless://${uuid}@${node.ip}:${port}?${params}#${encodeURIComponent(node.name)}`;
+/** 多 HOST 轮换：按节点序号取 hosts[i % n]，未配置则用请求 host */
+export function pickHost(cfg, requestHost, index) {
+  const hs = (cfg.hosts && cfg.hosts.length ? cfg.hosts : [requestHost]).filter(Boolean);
+  if (!hs.length) return requestHost;
+  return hs[index % hs.length];
 }
 
-export function buildTrojanUri(node, password, port, host) {
-  const params = `security=tls&sni=${host}&fp=chrome&type=ws&host=${host}&path=%2Ftrojan`;
-  return `trojan://${encodeURIComponent(password)}@${node.ip}:${port}?${params}#${encodeURIComponent(node.name)}`;
+/** 订阅 URI 的通用查询参数：0RTT / TLS 分片（按面板开关拼接） */
+export function subExtraParams(cfg) {
+  let p = '';
+  if (cfg.earlyData) p += '&ed=2048';
+  if (cfg.fragment) p += '&fragment=1,40-60,30-50,tlshello';
+  return p;
 }
 
-export function buildSsUri(node, method, password, port, host) {
+export function buildVlessUri(node, uuid, port, host, cfg) {
+  const p = node.port || port;
+  let params = `encryption=none&security=tls&sni=${host}&fp=chrome&type=ws&host=${host}&path=%2F${uuid}`;
+  params += subExtraParams(cfg || {});
+  return `vless://${uuid}@${node.ip}:${p}?${params}#${encodeURIComponent(node.name)}`;
+}
+
+export function buildTrojanUri(node, password, port, host, cfg) {
+  const p = node.port || port;
+  let params = `security=tls&sni=${host}&fp=chrome&type=ws&host=${host}&path=%2Ftrojan`;
+  params += subExtraParams(cfg || {});
+  return `trojan://${encodeURIComponent(password)}@${node.ip}:${p}?${params}#${encodeURIComponent(node.name)}`;
+}
+
+export function buildSsUri(node, method, password, port, host, useTls) {
+  const p = node.port || port;
   const userinfo = bytesToBase64(te.encode(`${method}:${password}`));
-  const plugin = encodeURIComponent(`v2ray-plugin;tls;host=${host};path=/ss`);
-  return `ss://${userinfo}@${node.ip}:${port}/?plugin=${plugin}#${encodeURIComponent(node.name)}`;
+  const tlsPart = useTls === false ? '' : ';tls';
+  const plugin = encodeURIComponent(`v2ray-plugin${tlsPart};host=${host};path=/ss`);
+  return `ss://${userinfo}@${node.ip}:${p}/?plugin=${plugin}#${encodeURIComponent(node.name)}`;
 }
 
-/** 通用 base64 订阅（v2rayN / Shadowrocket 等） */
-export function buildBase64Sub(nodes, cfg, host) {
+/** 通用 base64 订阅（v2rayN / Shadowrocket 等）。
+ *  extraLinks：?sub= 聚合进来的外部链接原文，直接追加。 */
+export function buildBase64Sub(nodes, cfg, host, extraLinks) {
   const lines = [];
-  for (const n of nodes) {
-    lines.push(buildVlessUri(n, cfg.UUID, cfg.nodePort, host));
-    if (cfg.trojanPassword) lines.push(buildTrojanUri(n, cfg.trojanPassword, cfg.nodePort, host));
-    if (cfg.ssPassword) lines.push(buildSsUri(n, cfg.ssMethod, cfg.ssPassword, cfg.nodePort, host));
-  }
+  nodes.forEach((n, i) => {
+    const h = pickHost(cfg, host, i);
+    lines.push(buildVlessUri(n, cfg.UUID, cfg.nodePort, h, cfg));
+    if (cfg.trojanPassword) lines.push(buildTrojanUri(n, cfg.trojanPassword, cfg.nodePort, h, cfg));
+    if (cfg.ssPassword) {
+      lines.push(buildSsUri(n, cfg.ssMethod, cfg.ssPassword, cfg.nodePort, h, true));
+      // SS 非 TLS 备用端口：额外生成一条 80 端口节点
+      if (cfg.ssAltPort > 0) {
+        const alt = { ...n, port: cfg.ssAltPort, name: n.name + ' 80' };
+        lines.push(buildSsUri(alt, cfg.ssMethod, cfg.ssPassword, cfg.ssAltPort, h, false));
+      }
+    }
+  });
+  for (const l of extraLinks || []) lines.push(l);
   return bytesToBase64(te.encode(lines.join('\n')));
 }
 
@@ -844,76 +1166,244 @@ function yamlStr(s) {
 /** Clash YAML 订阅 */
 export function buildClashSub(nodes, cfg, host) {
   const L = ['proxies:'];
-  for (const n of nodes) {
+  nodes.forEach((n, i) => {
+    const h = pickHost(cfg, host, i);   // 多 HOST 轮换
+    const p = n.port || cfg.nodePort;   // 单 IP 指定端口优先
     const name = yamlStr(n.name);
     L.push(`  - name: ${name}`);
     L.push(`    type: vless`);
     L.push(`    server: ${n.ip}`);
-    L.push(`    port: ${cfg.nodePort}`);
+    L.push(`    port: ${p}`);
     L.push(`    uuid: ${cfg.UUID}`);
     L.push(`    tls: true`);
-    L.push(`    servername: ${host}`);
+    L.push(`    servername: ${h}`);
     L.push(`    client-fingerprint: chrome`);
     L.push(`    network: ws`);
     L.push(`    ws-opts:`);
     L.push(`      path: /${cfg.UUID}`);
     L.push(`      headers:`);
-    L.push(`        Host: ${host}`);
+    L.push(`        Host: ${h}`);
     if (cfg.trojanPassword) {
       L.push(`  - name: ${name}`);
       L.push(`    type: trojan`);
       L.push(`    server: ${n.ip}`);
-      L.push(`    port: ${cfg.nodePort}`);
+      L.push(`    port: ${p}`);
       L.push(`    password: ${yamlStr(cfg.trojanPassword)}`);
-      L.push(`    sni: ${host}`);
+      L.push(`    sni: ${h}`);
       L.push(`    client-fingerprint: chrome`);
       L.push(`    network: ws`);
       L.push(`    ws-opts:`);
       L.push(`      path: /trojan`);
       L.push(`      headers:`);
-      L.push(`        Host: ${host}`);
+      L.push(`        Host: ${h}`);
     }
     if (cfg.ssPassword) {
       L.push(`  - name: ${name}`);
       L.push(`    type: ss`);
       L.push(`    server: ${n.ip}`);
-      L.push(`    port: ${cfg.nodePort}`);
+      L.push(`    port: ${p}`);
       L.push(`    cipher: ${cfg.ssMethod}`);
       L.push(`    password: ${yamlStr(cfg.ssPassword)}`);
       L.push(`    plugin: v2ray-plugin`);
       L.push(`    plugin-opts:`);
       L.push(`      mode: websocket`);
       L.push(`      tls: true`);
-      L.push(`      host: ${host}`);
+      L.push(`      host: ${h}`);
       L.push(`      path: /ss`);
+      if (cfg.ssAltPort > 0) {
+        // SS 非 TLS 备用端口节点
+        L.push(`  - name: ${yamlStr(n.name + ' 80')}`);
+        L.push(`    type: ss`);
+        L.push(`    server: ${n.ip}`);
+        L.push(`    port: ${cfg.ssAltPort}`);
+        L.push(`    cipher: ${cfg.ssMethod}`);
+        L.push(`    password: ${yamlStr(cfg.ssPassword)}`);
+        L.push(`    plugin: v2ray-plugin`);
+        L.push(`    plugin-opts:`);
+        L.push(`      mode: websocket`);
+        L.push(`      tls: false`);
+        L.push(`      host: ${h}`);
+        L.push(`      path: /ss`);
+      }
     }
-  }
+  });
   return L.join('\n') + '\n';
+}
+
+/* ------------------------------------------------------------------
+ * 更多订阅格式：Surge / Quantumult X / Loon
+ * 均为尽力而为的标准写法；SS 在这些客户端里按各自插件写法输出。
+ * ------------------------------------------------------------------ */
+
+/** Surge 订阅（proxy 段） */
+export function buildSurgeSub(nodes, cfg, host) {
+  const L = ['#!MANAGED-CONFIG https://example.com/surge.conf interval=86400', '', '[Proxy]'];
+  nodes.forEach((n, i) => {
+    const h = pickHost(cfg, host, i);
+    const p = n.port || cfg.nodePort;
+    const tag = n.name.replace(/,/g, ' ');
+    const extra = subExtraParams(cfg);
+    L.push(`${tag} = vless, ${n.ip}, ${p}, username=${cfg.UUID}, tls=true, sni=${h}, ws=true, ws-path=/${cfg.UUID}, ws-headers=Host:${h}, fingerprint=chrome${extra ? ', ' + extra.slice(1).replace(/&/g, ', ') : ''}`);
+    if (cfg.trojanPassword) {
+      L.push(`${tag} = trojan, ${n.ip}, ${p}, password=${cfg.trojanPassword}, sni=${h}, ws=true, ws-path=/trojan, ws-headers=Host:${h}, fingerprint=chrome`);
+    }
+    if (cfg.ssPassword) {
+      L.push(`${tag} = ss, ${n.ip}, ${p}, encrypt-method=${cfg.ssMethod}, password=${cfg.ssPassword}, ws=true, ws-path=/ss, ws-headers=Host:${h}, tls=true`);
+    }
+  });
+  L.push('', '[Proxy Group]', '影梭 = select, ' + nodes.map((n) => n.name.replace(/,/g, ' ')).join(', '));
+  return L.join('\n') + '\n';
+}
+
+/** Quantumult X 订阅 */
+export function buildQuanxSub(nodes, cfg, host) {
+  const L = [];
+  nodes.forEach((n, i) => {
+    const h = pickHost(cfg, host, i);
+    const p = n.port || cfg.nodePort;
+    const tag = `tag=${n.name.replace(/,/g, ' ')}`;
+    const extra = subExtraParams(cfg);
+    L.push(`vless=${n.ip}:${p}, method=none, password=${cfg.UUID}, fast-open=false, udp-relay=true, tls=true, sni=${h}, ws=true, ws-path=/${cfg.UUID}, ws-headers=Host:${h}, ${tag}${extra.replace(/&/g, ', ')}`);
+    if (cfg.trojanPassword) {
+      L.push(`trojan=${n.ip}:${p}, password=${cfg.trojanPassword}, over-tls=true, tls-host=${h}, ws=true, ws-path=/trojan, ws-headers=Host:${h}, ${tag}`);
+    }
+    if (cfg.ssPassword) {
+      L.push(`shadowsocks=${n.ip}:${p}, method=${cfg.ssMethod}, password=${cfg.ssPassword}, ws=true, ws-path=/ss, ws-headers=Host:${h}, tls=true, ${tag}`);
+    }
+  });
+  return L.join('\n') + '\n';
+}
+
+/** Loon 订阅 */
+export function buildLoonSub(nodes, cfg, host) {
+  const L = ['[Proxy]'];
+  nodes.forEach((n, i) => {
+    const h = pickHost(cfg, host, i);
+    const p = n.port || cfg.nodePort;
+    const tag = n.name.replace(/,/g, ' ');
+    L.push(`${tag} = VLESS,${n.ip},${p},${cfg.UUID},udp=true,tls=true,sni=${h},ws=true,ws-path=/${cfg.UUID},ws-headers=Host:${h},fingerprint=chrome`);
+    if (cfg.trojanPassword) {
+      L.push(`${tag} = Trojan,${n.ip},${p},${cfg.trojanPassword},udp=true,sni=${h},ws=true,ws-path=/trojan,ws-headers=Host:${h}`);
+    }
+    if (cfg.ssPassword) {
+      L.push(`${tag} = Shadowsocks,${n.ip},${p},${cfg.ssMethod},"${cfg.ssPassword}",udp=true,ws=true,ws-path=/ss,ws-headers=Host:${h},tls=true`);
+    }
+  });
+  return L.join('\n') + '\n';
+}
+
+/* ------------------------------------------------------------------
+ * 外部节点链接解析（用于 ?sub= 聚合）：解析 vless/trojan/ss 链接为
+ * {proto, server, port, id, name}，非法返回 null。
+ * ------------------------------------------------------------------ */
+export function parseNodeLink(link) {
+  const s = String(link || '').trim();
+  let m = s.match(/^vless:\/\/([^@]+)@([^:/?#]+)(?::(\d+))?[^#]*(?:#(.*))?$/i);
+  if (m) {
+    return { proto: 'vless', id: m[1], server: m[2], port: m[3] ? Number(m[3]) : 443, name: safeDecode(m[4] || 'vless'), raw: s };
+  }
+  m = s.match(/^trojan:\/\/([^@]+)@([^:/?#]+)(?::(\d+))?[^#]*(?:#(.*))?$/i);
+  if (m) {
+    return { proto: 'trojan', id: m[1], server: m[2], port: m[3] ? Number(m[3]) : 443, name: safeDecode(m[4] || 'trojan'), raw: s };
+  }
+  m = s.match(/^ss:\/\/([^@\/]+)@([^:/?#]+)(?::(\d+))?[^#]*(?:#(.*))?$/i);
+  if (m) {
+    let method = '', password = '';
+    try {
+      const up = td.decode(base64ToBytes(m[1]));
+      const ci = up.indexOf(':');
+      if (ci > 0) { method = up.slice(0, ci); password = up.slice(ci + 1); }
+    } catch { /* 忽略 */ }
+    return { proto: 'ss', method, password, server: m[2], port: m[3] ? Number(m[3]) : 443, name: safeDecode(m[4] || 'ss'), raw: s };
+  }
+  return null;
+}
+
+/** 安全解码 URI 片段（失败返回原文） */
+export function safeDecode(s) {
+  try { return decodeURIComponent(s); } catch { return s; }
+}
+
+/** 从 ?sub= 指定的外部订阅拉取节点链接原文数组（去重） */
+export async function fetchAggSubLinks(subUrl) {
+  const links = [];
+  try {
+    const u = new URL(subUrl);
+    if (!/^https?:$/.test(u.protocol)) return links;
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 15000);
+    const res = await fetch(subUrl, { signal: ctrl.signal, headers: { 'user-agent': 'shadowshuttle/2.0' } });
+    clearTimeout(timer);
+    if (!res.ok) return links;
+    let text = await res.text();
+    text = text.trim();
+    if (!text.includes('://') && /^[A-Za-z0-9+/=\r\n\s]+$/.test(text)) {
+      try { text = td.decode(base64ToBytes(text.replace(/\s+/g, ''))); } catch { /* 按原文 */ }
+    }
+    for (const line of text.split('\n')) {
+      const s = line.trim();
+      if (s && /^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(s)) links.push(s);
+    }
+  } catch { /* 忽略 */ }
+  return [...new Set(links)];
+}
+
+/* ------------------------------------------------------------------
+ * 订阅格式识别：显式 ?target= 参数优先，其次 UA 嗅探，默认 base64。
+ * ------------------------------------------------------------------ */
+export const SUB_FORMATS = ['base64', 'clash', 'singbox', 'surge', 'quanx', 'loon'];
+
+export function detectSubFormat(request, explicitPath) {
+  if (explicitPath && SUB_FORMATS.includes(explicitPath)) return explicitPath;
+  try {
+    const u = new URL(request.url);
+    const t = (u.searchParams.get('target') || '').toLowerCase();
+    if (SUB_FORMATS.includes(t)) return t;
+    // 兼容 subconverter 风格的 target 名
+    if (t === 'mixed') return 'base64';
+  } catch { /* 忽略 */ }
+  const ua = (request.headers.get('user-agent') || '').toLowerCase();
+  if (ua.includes('clash') || ua.includes('stash')) return 'clash';
+  if (ua.includes('sing-box') || ua.includes('singbox') || ua.includes('sfa')) return 'singbox';
+  if (ua.includes('surge')) return 'surge';
+  if (ua.includes('quantumult')) return 'quanx';
+  if (ua.includes('loon')) return 'loon';
+  return 'base64';
 }
 
 /** sing-box JSON 订阅 */
 export function buildSingboxSub(nodes, cfg, host) {
   const outbounds = [];
-  for (const n of nodes) {
-    const tls = { enabled: true, server_name: host, utls: { enabled: true, fingerprint: 'chrome' } };
-    const ws = (path) => ({ type: 'ws', path, headers: { Host: host } });
+  nodes.forEach((n, i) => {
+    const h = pickHost(cfg, host, i);   // 多 HOST 轮换
+    const p = n.port || cfg.nodePort;   // 单 IP 指定端口优先
+    const tls = { enabled: true, server_name: h, utls: { enabled: true, fingerprint: 'chrome' } };
+    const ws = (path) => ({ type: 'ws', path, headers: { Host: h } });
     outbounds.push({
-      type: 'vless', tag: n.name, server: n.ip, server_port: cfg.nodePort,
+      type: 'vless', tag: n.name, server: n.ip, server_port: p,
       uuid: cfg.UUID, tls, transport: ws(`/${cfg.UUID}`),
     });
     if (cfg.trojanPassword) {
       outbounds.push({
-        type: 'trojan', tag: n.name, server: n.ip, server_port: cfg.nodePort,
+        type: 'trojan', tag: n.name, server: n.ip, server_port: p,
         password: cfg.trojanPassword, tls, transport: ws('/trojan'),
       });
     }
     if (cfg.ssPassword) {
       outbounds.push({
-        type: 'shadowsocks', tag: n.name, server: n.ip, server_port: cfg.nodePort,
+        type: 'shadowsocks', tag: n.name, server: n.ip, server_port: p,
         method: cfg.ssMethod, password: cfg.ssPassword, tls, transport: ws('/ss'),
       });
+      if (cfg.ssAltPort > 0) {
+        // SS 非 TLS 备用端口节点
+        outbounds.push({
+          type: 'shadowsocks', tag: n.name + ' 80', server: n.ip, server_port: cfg.ssAltPort,
+          method: cfg.ssMethod, password: cfg.ssPassword,
+          transport: { type: 'ws', path: '/ss', headers: { Host: h } },
+        });
+      }
     }
-  }
+  });
   return JSON.stringify({ outbounds }, null, 2);
 }
 
@@ -1254,15 +1744,36 @@ async function handleLogout(request, env) {
 function handleGetConfig(cfg, env) {
   return json({
     hasKV: !!env.KV,
+    version: SS_VERSION,
     UUID: cfg.UUID,
     multiUUID: cfg.multiUUID,
     trojanPassword: cfg.trojanPassword,
     ssPassword: cfg.ssPassword,
     ssMethod: cfg.ssMethod,
+    ssAltPort: cfg.ssAltPort,
+    subKey: cfg.subKey,
+    hosts: cfg.hosts,
+    nodePort: cfg.nodePort,
+    earlyData: cfg.earlyData,
+    fragment: cfg.fragment,
     preferredSources: cfg.preferredSources,
     preferredStatic: cfg.preferredStatic,
+    randIPCount: cfg.randIPCount,
+    randIPPort: cfg.randIPPort,
     proxyIP: cfg.proxyIP,
-    nodePort: cfg.nodePort,
+    chainEnabled: cfg.chainEnabled,
+    chainType: cfg.chainType,
+    chainHost: cfg.chainHost,
+    chainPort: cfg.chainPort,
+    chainUser: cfg.chainUser,
+    chainPass: '', // 密码不回显，前端留空=不修改
+    chainWhitelist: cfg.chainWhitelist,
+    logEnabled: cfg.logEnabled,
+    tgEnabled: cfg.tgEnabled,
+    tgBotToken: '', // Token 不回显
+    tgChatId: cfg.tgChatId,
+    cfApiToken: '', // Token 不回显
+    cfAccountId: cfg.cfAccountId,
     subPath: cfg.subPath,
     subPathCustom: cfg.subPathCustom || '',
     disguiseHTML: cfg.disguiseHTML,
