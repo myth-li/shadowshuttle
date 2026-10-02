@@ -1189,15 +1189,9 @@ load();
 /** 默认伪装首页（nginx 风格） */
 export function defaultDisguiseHTML() {
   return `<!DOCTYPE html>
-<html><head><meta charset="utf-8"><title>Welcome to nginx!</title>
-<style>body{width:35em;margin:0 auto;font-family:Tahoma,Verdana,Arial,sans-serif;}</style>
-</head><body>
-<h1>Welcome to nginx!</h1>
-<p>If you see this page, the nginx web server is successfully installed and working. Further configuration is required.</p>
-<p>For online documentation and support please refer to <a href="http://nginx.org/">nginx.org</a>.<br>
-Commercial support is available at <a href="http://nginx.com/">nginx.com</a>.</p>
-<p><em>Thank you for using nginx.</em></p>
-</body></html>`;
+<html><head><meta charset="utf-8"><title>404 Not Found</title>
+<style>body{font-family:system-ui,-apple-system,sans-serif;color:#333;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;}h1{font-size:24px;font-weight:600;}p{color:#888;}</style>
+</head><body><div><h1>404 Not Found</h1><p>The requested URL was not found on this server.</p></div></body></html>`;
 }
 
 /* ------------------------------------------------------------------
