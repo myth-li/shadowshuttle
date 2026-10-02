@@ -24,7 +24,7 @@
  * 版本变更记录见仓库根目录 CHANGELOG.md。
  */
 
-export const SS_VERSION = '2.0.0';
+export const SS_VERSION = '3.0.0';
 
 /* ------------------------------------------------------------------
  * 国家代码 → 中文国名映射表（ISO 3166-1 alpha-2）
@@ -1733,11 +1733,13 @@ function cssBase() {
   --line:#e6e8ec; --accent:#2563eb; --accent-soft:#e9f0fd;
   --danger:#dc2626; --danger-soft:#fdf0f0; --ok:#16a34a;
   --radius:10px;
+  color-scheme:light; /* 原生控件（数字微调/滚动条）跟随浅色 */
 }
 [data-theme="dark"]{
   --bg:#0c1016; --card:#141a24; --text:#e8ebf1; --muted:#98a1b3;
   --line:#232c3b; --accent:#2563eb; --accent-soft:#17294d;
   --danger:#f87171; --danger-soft:#2b1416; --ok:#34d399;
+  color-scheme:dark; /* 深色下原生控件不刺眼 */
 }
 *{box-sizing:border-box}
 html{-webkit-text-size-adjust:100%}
@@ -1802,12 +1804,15 @@ input[readonly].inp{background:var(--bg);cursor:default}
 
 /* 按钮层级：实心强调 / 灰色幽灵 / 红色幽灵 */
 .btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;
-  padding:8px 18px;border-radius:8px;border:1px solid transparent;font:inherit;cursor:pointer;white-space:nowrap}
+  padding:8px 18px;border-radius:8px;border:1px solid transparent;font:inherit;cursor:pointer;white-space:nowrap;
+  transition:border-color .15s, color .15s, background .15s, filter .15s}
 .btn-pri{background:var(--accent);color:#fff;font-weight:600}
 .btn-pri:hover{filter:brightness(1.08)}
 .btn-ghost{background:transparent;border-color:var(--line);color:var(--text)}
 .btn-ghost:hover{border-color:var(--muted)}
 .btn-danger-ghost{background:transparent;border-color:var(--danger);color:var(--danger)}
+/* 复制成功态：绿边 + 勾选，给用户明确反馈 */
+.btn.copied{border-color:var(--ok);color:var(--ok)}
 .btn-sm{padding:5px 12px;font-size:13px}
 .btn:disabled{opacity:.55;cursor:default}
 .ibtn{width:34px;height:34px;border:1px solid var(--line);border-radius:8px;background:transparent;
@@ -2084,9 +2089,12 @@ function adminApp(SUB_INIT) {
   function closeModal() { $('modalRoot').innerHTML = ''; }
   function copyText(t, btn) {
     function done() {
+      // 反馈三连：按钮变"✓ 已复制"+绿边、1.2 秒后恢复、右上 toast；
+      // 比单纯改文字更醒目，手机端尤其需要（剪贴板无系统提示时）。
       var old = btn.textContent;
-      btn.textContent = '已复制';
-      setTimeout(function () { btn.textContent = old; }, 1200);
+      btn.textContent = '✓ 已复制';
+      btn.classList.add('copied');
+      setTimeout(function () { btn.textContent = old; btn.classList.remove('copied'); }, 1200);
       toast('已复制到剪贴板');
     }
     function fallback() {

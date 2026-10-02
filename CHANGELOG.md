@@ -2,6 +2,50 @@
 
 本文档记录每次版本变更，方便以后更新版本时对照。
 
+## v3.0.0（2026-10-03）
+
+### 出站
+- HTTPS 链式代理：`secureTransport:"on"` 对代理服务器建 TLS，再在加密隧道里发
+  CONNECT（之前明确抛错"暂不支持"）。chainHost 请填域名（证书校验需要）。
+- 拨号调优：新增"并发拨号"开关（面板"出站与回落"），同时拨直连/链式/回落取最快
+  成功的，落败者自动关闭；全败时剩余项串行补试，回落语义不丢。默认关闭（串行）。
+- 自适应超时：拨号超时面板可填毫秒，0=自适应——按历史平均耗时动态调整，
+  弱网（失败多于成功）时自动收紧、快速失败试下一条；1200~8000ms 钳制。
+
+### 传输
+- gRPC trailers：流结束时补 trailer 帧（首字节 0x80，`grpc-status:0`），严格
+  gRPC 客户端靠它确认 RPC 正常完成，不再断连重试；响应头仍带 grpc-status 兼容。
+- XHTTP：保持 stream-one。stream-up / packet-up 经评估不支持——需要跨请求的
+  低延迟会话状态，Workers isolate 无状态、KV 最终一致性太慢；客户端用 auto
+  会自动协商到 stream-one（见代码注释）。
+
+### Trojan
+- Fallback 路径：`/trojan=IP:端口`，Trojan UDP 在密码校验后透传给自建服务器
+  （Workers 无 UDP 出站，交由有完整 UDP 能力的自建 Trojan 处理）；TCP 仍按
+  头内目标正常拨号。非法格式返回 400。
+
+### 测速模式
+- 目标命中测速域名名单（默认 speedtest.net / speed.cloudflare.com / fast.com，
+  面板可改，清空=关闭）时，Worker 本地回显、不经过出站——测到的是客户端↔Worker
+  真实带宽，不受测速站限速影响。VLESS/Trojan/SS/gRPC/XHTTP 全传输生效。
+
+### 订阅
+- Token 每日轮换（可选，默认关闭）：开启后订阅 token 按日期派生
+  `sha256(固定token|YYYY-MM-DD)` 前 32 位，旧链接次日自动失效；日期用 UTC，
+  保证全球同一天算出同一 token。
+
+### 面板打磨
+- 复制按钮：成功态变为"✓ 已复制"+绿边，1.2 秒后恢复，并有 toast 提示。
+- 深色模式：补 `color-scheme`，原生控件（数字微调/滚动条）不再刺眼；按钮加过渡。
+- 新增配置项：并发拨号/并发数/拨号超时、测速域名、Token 日轮换。
+
+### 已知限制
+- Workers 无 UDP socket：Trojan 经 fallback 可透传；VLESS/SS 的 UDP（除 DNS 经
+  DoH）仍优雅关闭。
+- XHTTP stream-up / packet-up 不支持（见上）。
+- ip-api.com 免费版 45 次/分钟，归属地 KV 缓存 30 天；未知显示 🌐 未知，后台补齐。
+- Surge/QuanX/Loon 的 SS+WS 写法按各客户端常见格式尽力输出，极端客户端可能需微调。
+
 ## v2.0.0（2026-10-03）
 
 v1 用户反馈"功能太差""界面好难看"后的重构版本。相对 edgetunnel 只多不少，
