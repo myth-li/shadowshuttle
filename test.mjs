@@ -1,5 +1,5 @@
 /**
- * myth-tunnel 纯逻辑自测（node 运行）
+ * 影梭 ShadowShuttle 纯逻辑自测（node 运行）
  * 用法：node test.mjs
  * 覆盖：SHA-256/SHA-224、ChaCha20-Poly1305（RFC 8439 向量 + node:crypto 交叉验证）、
  *       HKDF-SHA1、VLESS/Trojan 头解析、SS AEAD 回环、国旗/国名映射、订阅拼装。

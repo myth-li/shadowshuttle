@@ -1,9 +1,9 @@
-# myth-tunnel 的 wrangler 部署配置
+# 影梭 ShadowShuttle 的 wrangler 部署配置
 # 用法：wrangler deploy
 # 注意：不要用 wrangler 部署到已有的线上 Worker（会覆盖对应 name 的项目），
 # 建议先在 dashboard 新建 Worker 粘贴 _worker.js 测试，确认无误后再切换域名。
 
-name = "myth-tunnel"
+name = "shadowshuttle"
 main = "_worker.js"
 compatibility_date = "2026-01-01"
 

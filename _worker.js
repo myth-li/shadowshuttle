@@ -1,5 +1,5 @@
 /**
- * myth-tunnel — 自研 Cloudflare Worker 代理
+ * 影梭 ShadowShuttle — 自研 Cloudflare Worker 代理
  * ============================================================
  * clean-room 实现：VLESS / Trojan / Shadowsocks over WebSocket，
  * 优选 IP 订阅生成（国旗+中文国名+序号命名），现代简约管理面板。
@@ -12,7 +12,7 @@
  * 或用 wrangler deploy。纯逻辑函数同时 export，供 node 自测。
  */
 
-export const MT_VERSION = '1.0.0';
+export const SS_VERSION = '1.0.0';
 
 /* ------------------------------------------------------------------
  * 国家代码 → 中文国名映射表（ISO 3166-1 alpha-2）
@@ -610,12 +610,12 @@ export class WsReader {
 /* ------------------------------------------------------------------
  * 配置模型
  * Worker Variables（必填）：ADMIN / UUID / SUB_TOKEN
- * 其余可选项存 KV（key: mt:config），Variables 做兜底。
+ * 其余可选项存 KV（key: ss:config），Variables 做兜底。
  * ------------------------------------------------------------------ */
-const KV_CONFIG_KEY = 'mt:config';
-const KV_SESSION_PREFIX = 'mt:session:';
-const KV_GEO_PREFIX = 'mt:geo:';
-const KV_SRC_PREFIX = 'mt:src:';
+const KV_CONFIG_KEY = 'ss:config';
+const KV_SESSION_PREFIX = 'ss:session:';
+const KV_GEO_PREFIX = 'ss:geo:';
+const KV_SRC_PREFIX = 'ss:src:';
 
 const DEFAULT_CONFIG = {
   multiUUID: [],            // 多用户 UUID 数组
@@ -959,7 +959,7 @@ function cssBase() {
 export function loginPageHTML() {
   return `<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>登录 · myth-tunnel</title>
+<title>登录 · 影梭 ShadowShuttle</title>
 <style>${cssBase()}
 .login-box { max-width: 360px; margin: 12vh auto 0; }
 .login-box h1 { font-size: 20px; font-weight: 600; margin-bottom: 4px; }
@@ -968,7 +968,7 @@ export function loginPageHTML() {
 </style></head>
 <body>
 <div class="wrap"><div class="card login-box">
-  <h1>myth-tunnel</h1>
+  <h1>影梭 ShadowShuttle</h1>
   <div class="sub">管理后台登录</div>
   <div class="field"><label>管理密码</label>
     <input type="password" id="pw" placeholder="输入 ADMIN 密码" autocomplete="current-password"></div>
@@ -994,7 +994,7 @@ pw.focus();
 export function adminPageHTML(subPath) {
   return `<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>管理后台 · myth-tunnel</title>
+<title>管理后台 · 影梭 ShadowShuttle</title>
 <style>${cssBase()}
 .topbar { display: flex; align-items: center; justify-content: space-between; margin-bottom: 24px; }
 .topbar h1 { font-size: 18px; font-weight: 600; }
@@ -1020,7 +1020,7 @@ export function adminPageHTML(subPath) {
 <body>
 <div class="wrap">
   <div class="topbar">
-    <div><h1>myth-tunnel<span class="ver">v${MT_VERSION}</span></h1></div>
+    <div><h1>影梭 ShadowShuttle<span class="ver">v${SS_VERSION}</span></h1></div>
     <button class="btn btn-ghost btn-sm" id="logout">退出登录</button>
   </div>
   <div id="kvWarn" class="warn" style="display:none">未检测到 KV 绑定：配置无法保存。请在 Worker 设置里绑定 KV（变量名 KV）后再使用。</div>
@@ -1228,7 +1228,7 @@ async function checkSession(request, env) {
   const kv = env.KV;
   if (!kv) return false;
   const cookie = request.headers.get('Cookie') || '';
-  const m = /(?:^|;\s*)mt_session=([0-9a-f]+)/.exec(cookie);
+  const m = /(?:^|;\s*)ss_session=([0-9a-f]+)/.exec(cookie);
   if (!m) return false;
   try {
     return !!(await kv.get(KV_SESSION_PREFIX + m[1]));
@@ -1245,16 +1245,16 @@ async function handleLogin(request, env, cfg, url) {
   if (!token) return json({ error: 'KV 未绑定，无法创建会话' }, 500);
   const secure = url.protocol === 'https:' ? '; Secure' : '';
   return json({ ok: true }, 200, {
-    'Set-Cookie': `mt_session=${token}; HttpOnly; Path=/; Max-Age=3600; SameSite=Lax${secure}`,
+    'Set-Cookie': `ss_session=${token}; HttpOnly; Path=/; Max-Age=3600; SameSite=Lax${secure}`,
   });
 }
 
 async function handleLogout(request, env) {
   const kv = env.KV;
   const cookie = request.headers.get('Cookie') || '';
-  const m = /(?:^|;\s*)mt_session=([0-9a-f]+)/.exec(cookie);
+  const m = /(?:^|;\s*)ss_session=([0-9a-f]+)/.exec(cookie);
   if (kv && m) { try { await kv.delete(KV_SESSION_PREFIX + m[1]); } catch { /* 忽略 */ } }
-  return json({ ok: true }, 200, { 'Set-Cookie': 'mt_session=; HttpOnly; Path=/; Max-Age=0' });
+  return json({ ok: true }, 200, { 'Set-Cookie': 'ss_session=; HttpOnly; Path=/; Max-Age=0' });
 }
 
 function handleGetConfig(cfg, env) {

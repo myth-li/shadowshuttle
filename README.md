@@ -1,41 +1,59 @@
-# myth-tunnel
-Self-built Cloudflare Worker proxy (VLESS / Trojan / Shadowsocks) with preferred-IP subscription
+# 影梭 ShadowShuttle
 
-自研单文件 Cloudflare Worker 代理：VLESS / Trojan / Shadowsocks over WebSocket，
-带优选 IP 订阅（节点名自动标注国旗+中文国名+序号）与现代简约风管理面板。
-clean-room 实现，只参考公开协议规范编写。
+> **单文件、零依赖的 Cloudflare Worker 代理** —— VLESS / Trojan / Shadowsocks 三协议 over WebSocket，
+> 优选 IP 自动聚合订阅，节点按 `🇺🇸 美国 01` 格式命名，3 分钟部署上线。
 
-## 功能
+<p>
+  <a href="https://github.com/myth-li/shadowshuttle/stargazers"><img alt="stars" src="https://img.shields.io/github/stars/myth-li/shadowshuttle?style=flat"></a>
+  <a href="https://github.com/myth-li/shadowshuttle/blob/main/LICENSE"><img alt="license" src="https://img.shields.io/github/license/myth-li/shadowshuttle"></a>
+</p>
 
-- **三协议**：VLESS、Trojan、Shadowsocks（AEAD：aes-128-gcm / aes-256-gcm / chacha20-ietf-poly1305）over WebSocket
-- **优选 IP 订阅**：来源 URL 抓取 + 静态列表，去重后每个 IP 生成 VLESS / Trojan / SS 三个节点
-- **节点命名**：`🇺🇸 美国 01` —— 国旗 emoji + 中文国名（内置约 240 项映射表）+ 全局两位序号
-- **三种订阅格式**：通用 base64（v2rayN / Shadowrocket）、Clash YAML、sing-box JSON
-- **管理面板**：现代简约风格（无外部 CDN，单文件离线可用），可改多用户、密码、优选 IP 源、回落 IP、伪装页等
-- **出站**：`cloudflare:sockets` TCP 直连；直连失败且配了 proxyIP 时回落重试一次
-- **UDP**：仅 DNS（53 端口）经 DoH 中继，其余 UDP 优雅关闭、不断 TCP
+[English version](#english) | [问题反馈](https://github.com/myth-li/shadowshuttle/issues)
 
-## 快速部署（dashboard 粘贴，推荐）
+---
 
-1. 打开 [Cloudflare dashboard](https://dash.cloudflare.com) → Workers & Pages → Create → Create Worker → Deploy
-2. 点 **Edit code**，把本仓库 `_worker.js` 的全部内容粘贴进去，**Deploy**
-3. 左侧 Settings → Variables and Secrets → 添加明文变量（Add variable）：
-   - `ADMIN`：后台密码（必填，建议同时在面板里改复杂）
-   - `UUID`：VLESS 主 UUID（必填，用 `uuidgen` 或在线生成标准格式）
-   - `SUB_TOKEN`：订阅路径 token（必填，随机长字符串，别人猜不到订阅地址）
-4. **绑定 KV**（Variables and Secrets → KV namespace bindings → Add binding）：
-   - Variable name 填 `KV`，选你的 namespace（没有就先去 Storage & databases → KV 新建一个）
-   - 不绑也能跑，但面板配置改完重启会丢，且会失去优选 IP 缓存与 GeoIP 缓存
-5. 访问 `https://<你的worker域名>/login`，用 ADMIN 密码登录管理面板
+## ✨ 功能亮点
 
-> 先在新 Worker 上测好，确认没问题再把正式域名（如 dpdns.org 的路由）切过来；
-> 线上已有业务的 Worker 不要直接覆盖。
+- **三协议全支持**：VLESS、Trojan、Shadowsocks（AES-128-GCM / AES-256-GCM / ChaCha20-Poly1305）全部跑在 WebSocket 上，一个 Worker 全搞定
+- **优选 IP 订阅**：来源 URL 自动抓取 + 静态列表，去重聚合，每个 IP 自动生成 VLESS / Trojan / SS 三个节点
+- **看得懂的节点名**：`🇺🇸 美国 01`、`🇭🇰 香港 02` —— 国旗 emoji + 中文国名（内置约 240 项映射）+ 全局序号，订阅里一眼找到想要的线路
+- **三种订阅格式**：通用 base64（v2rayN / Shadowrocket）、Clash YAML、sing-box JSON，一次配置多端通用
+- **现代简约管理面板**：无外部依赖、单文件离线可用；多用户、密码、优选 IP 源、回落 IP、伪装页全部可视化配置
+- **智能回落**：出站直连失败时自动用 proxyIP 重试一次；伪装首页让扫描器无功而返
+- **clean-room 自研**：只参考公开协议规范逐行手写，SHA-224 / ChaCha20-Poly1305 等 Workers 缺失的算法全部内置实现
 
-## wrangler 部署
+## 📸 截图
+
+| 管理面板 | 订阅节点 |
+|---|---|
+| ![管理面板](docs/screenshot-admin.png) | ![订阅节点](docs/screenshot-nodes.png) |
+
+> 截图待补充（docs/ 目录占位）。
+
+## 🚀 3 步部署
+
+**第 1 步** —— Cloudflare Dashboard → Workers & Pages → Create Worker → Deploy → **Edit code**，
+把 [`_worker.js`](https://github.com/myth-li/shadowshuttle/blob/main/_worker.js) 全文粘贴进去，**Deploy**。
+
+**第 2 步** —— Settings → Variables and Secrets，添加三个变量：
+
+| 变量 | 说明 |
+|---|---|
+| `ADMIN` | 后台密码（`/login` 用） |
+| `UUID` | VLESS 主 UUID（标准 8-4-4-4-12 格式） |
+| `SUB_TOKEN` | 订阅路径 token（随机长字符串，猜不到才安全） |
+
+**第 3 步** —— 绑定 KV：Variables and Secrets → KV namespace bindings → Add binding，
+Variable name 填 `KV`（没有 namespace 先去 Storage & databases → KV 新建一个）。
+打开 `https://<你的域名>/login` 登录管理面板，开始添加优选 IP。
+
+> 💡 先在新 Worker 上测好，确认没问题再把正式域名切过来；有线上业务的 Worker 不要直接覆盖。
+
+<details>
+<summary>用 wrangler 部署（可选）</summary>
 
 ```bash
-npm i -g wrangler
-wrangler login
+npm i -g wrangler && wrangler login
 # 填好 wrangler.toml 里的 KV namespace id
 wrangler kv namespace create KV
 wrangler secret put ADMIN
@@ -44,59 +62,119 @@ wrangler secret put SUB_TOKEN
 wrangler deploy
 ```
 
-## 变量说明
+</details>
 
-| 变量 | 必填 | 位置 | 说明 |
-|---|---|---|---|
-| `ADMIN` | 是 | Variables/Secret | 后台登录密码 |
-| `UUID` | 是 | Variables | VLESS 主 UUID，也是 WS 路径 `/{UUID}` |
-| `SUB_TOKEN` | 是 | Variables | 订阅路径 token，订阅地址为 `/{SUB_TOKEN}` |
+## ⚙️ 配置说明
 
-其余配置在管理面板里改，存 KV（key `mt:config` 的 JSON），Variables 做兜底：
+`ADMIN` / `UUID` / `SUB_TOKEN` 只从 Worker Variables 读取；其余在管理面板里改，
+存 KV（key `ss:config`），Variables 做兜底：
 
 | 配置项 | 说明 |
 |---|---|
-| multiUUID | 多用户 UUID（数组），除主 UUID 外的合法用户 |
-| trojanPassword / ssPassword / ssMethod | Trojan 密码；SS 密码与加密 method |
-| preferredSources | 优选 IP 源 URL（每行一个，文本源每行一个 IP；抓取结果 KV 缓存 6 小时） |
+| multiUUID | 多用户 UUID 数组（除主 UUID 外的合法用户） |
+| trojanPassword / ssPassword / ssMethod | Trojan 密码；SS 密码与加密方式 |
+| preferredSources | 优选 IP 源 URL（每行一个；文本源每行一个 IP，抓取结果 KV 缓存 6 小时） |
 | preferredStatic | 静态优选 IP（每行一个） |
-| proxyIP | 出站直连失败时的回落 IP（可选，如 CDN IP） |
+| proxyIP | 出站直连失败时的回落 IP（可选） |
 | nodePort | 订阅节点端口（默认 443） |
 | disguiseHTML | 伪装首页 HTML（默认 nginx 风格，可自定义） |
 | subPath | 订阅路径（默认 `/{SUB_TOKEN}`） |
 
-## 路由一览
+## 📡 订阅地址
+
+| 格式 | 地址 | 适用客户端 |
+|---|---|---|
+| 通用 base64 | `https://<域名>/{SUB_TOKEN}` | v2rayN / v2rayNG / Shadowrocket |
+| Clash | `https://<域名>/{SUB_TOKEN}/clash` | Clash / ClashMeta |
+| sing-box | `https://<域名>/{SUB_TOKEN}/singbox` | sing-box / SFA |
+
+## 🗺 路由一览
 
 | 路径 | 说明 |
 |---|---|
 | `GET /` | 伪装首页 |
-| `GET /login` / `POST /api/login` | 登录（成功 Set-Cookie `mt_session`，KV token 1 小时过期） |
-| `GET /admin` | 管理面板（未登录跳 /login） |
-| `GET/POST /api/config`、`/api/logout` | 读写配置 / 登出（需登录） |
-| `GET /{SUB_TOKEN}` | base64 通用订阅 |
-| `GET /{SUB_TOKEN}/clash` | Clash YAML 订阅 |
-| `GET /{SUB_TOKEN}/singbox` | sing-box JSON 订阅 |
-| WS `/{UUID}` | VLESS（early data 从 Sec-WebSocket-Protocol 取） |
-| WS `/trojan` | Trojan（首包 sha224 hex 验密码，常量时间比较） |
-| WS `/ss` | Shadowsocks（AEAD，salt+地址头解密） |
+| `GET /login` · `POST /api/login` | 登录（Cookie `ss_session`，KV token 1 小时过期） |
+| `GET /admin` | 管理面板（未登录跳转 `/login`） |
+| `GET/POST /api/config` · `/api/logout` | 读写配置 / 登出（需登录） |
+| WS `/{UUID}` | VLESS（含 early data） |
+| WS `/trojan` | Trojan（sha224 hex 验密码，常量时间比较） |
+| WS `/ss` | Shadowsocks AEAD |
 
-## 自测
+## 🧪 自测
 
-纯逻辑部分有 node 自测脚本（不依赖 Workers API）：
+纯逻辑部分有 node 自测脚本（不依赖 Workers API），提交前已全量通过：
 
 ```bash
-node test.mjs
+node test.mjs   # 45 项：RFC 8439 向量、node:crypto 交叉验证、协议头解析、订阅拼装…
 ```
 
-覆盖：SHA-256/SHA-224、ChaCha20-Poly1305（RFC 8439 附录 A.5 向量 + node:crypto 交叉验证）、
-HKDF-SHA1、VLESS/Trojan 头解析、SS 三种 method 加解密回环、国旗/国名映射、
-节点命名排序、三种订阅格式拼装。
+## ⚠️ 已知限制
 
-## 已知限制
+- Workers 无 UDP socket：仅 DNS（目的 53 端口）经 DoH 中继，其他 UDP 优雅关闭、不影响 TCP。
+- IP 归属地走 `ip-api.com` 免费接口（45 次/分钟限流），结果 KV 缓存 30 天；查不到的显示 `🌐 未知`，后台异步补齐。
+- SS AEAD nonce 为 12 字节小端递增（shadowsocks-rust / v2ray 事实标准）。
 
-- Workers 没有 UDP socket：只有 DNS 查询（目的 53 端口）经 DoH（1.1.1.1 / cloudflare-dns.com）中继，
-  其他 UDP（如游戏、VoIP、BT）会被优雅关闭，不影响 TCP 连接。
-- IP 归属地用 `ip-api.com` 免费接口（http，45 次/分钟限流），结果 KV 缓存 30 天；
-  查不到的 IP 节点名显示 `🌐 未知`，后台异步补齐，不阻塞订阅生成。
-- SS AEAD nonce 采用 12 字节小端递增（shadowsocks-rust / v2ray 事实标准）；
-  Trojan UDP 包分帧按 `ATYP+ADDR+PORT+LEN(2)+DATA` 解析（规范未完全明确，解析失败则关闭该连接）。
+## 📄 License
+
+MIT —— 详见 [LICENSE](https://github.com/myth-li/shadowshuttle/blob/main/LICENSE)。
+欢迎 star ⭐、提 issue 和 PR。
+
+---
+
+<a id="english"></a>
+# ShadowShuttle (English)
+
+> **A single-file, zero-dependency Cloudflare Worker proxy** — VLESS / Trojan / Shadowsocks over WebSocket,
+> with preferred-IP subscription auto-aggregation and nodes named like `🇺🇸 United States 01`. Deploy in 3 minutes.
+
+## ✨ Highlights
+
+- **All three protocols**: VLESS, Trojan, Shadowsocks (AES-128-GCM / AES-256-GCM / ChaCha20-Poly1305) over WebSocket — one Worker does it all
+- **Preferred-IP subscriptions**: auto-fetch from source URLs + static list, deduplicated; every IP becomes 3 nodes (one per protocol)
+- **Readable node names**: `🇺🇸 United States 01` — flag emoji + Chinese country name (built-in ~240-entry map) + global sequence number
+- **3 subscription formats**: generic base64 (v2rayN / Shadowrocket), Clash YAML, sing-box JSON
+- **Modern minimal admin panel**: no external CDN, works offline as a single file; manage users, passwords, IP sources, fallback IP and disguise page visually
+- **Smart fallback**: retries once via `proxyIP` when direct outbound fails; disguise homepage shrugs off scanners
+- **Clean-room implementation**: hand-written from public protocol specs only; missing Workers primitives (SHA-224, ChaCha20-Poly1305) implemented in pure JS
+
+## 🚀 Deploy in 3 steps
+
+**1.** Cloudflare Dashboard → Workers & Pages → Create Worker → Deploy → **Edit code**,
+paste the whole [`_worker.js`](https://github.com/myth-li/shadowshuttle/blob/main/_worker.js), **Deploy**.
+
+**2.** Settings → Variables and Secrets, add:
+`ADMIN` (panel password), `UUID` (main VLESS UUID), `SUB_TOKEN` (random subscription path token).
+
+**3.** Bind KV: Add binding with Variable name `KV` (create a namespace under Storage & databases → KV first).
+Open `https://<your-domain>/login` and add your preferred IPs.
+
+> 💡 Test on a fresh Worker first; only then switch your production domain over.
+
+## ⚙️ Configuration
+
+`ADMIN` / `UUID` / `SUB_TOKEN` come from Worker Variables only. Everything else is editable
+in the admin panel and stored in KV (key `ss:config`): `multiUUID`, `trojanPassword`,
+`ssPassword`, `ssMethod`, `preferredSources`, `preferredStatic`, `proxyIP`, `nodePort`,
+`disguiseHTML`, `subPath`.
+
+## 📡 Subscriptions
+
+- `https://<domain>/{SUB_TOKEN}` — generic base64 (v2rayN / Shadowrocket)
+- `https://<domain>/{SUB_TOKEN}/clash` — Clash YAML
+- `https://<domain>/{SUB_TOKEN}/singbox` — sing-box JSON
+
+## 🧪 Tests
+
+```bash
+node test.mjs   # 45 checks: RFC 8439 vectors, node:crypto cross-validation, header parsing, subscription building…
+```
+
+## ⚠️ Limitations
+
+- No UDP sockets in Workers: only DNS (port 53) is relayed via DoH; other UDP is gracefully closed without breaking TCP.
+- GeoIP via `ip-api.com` free tier (45 req/min), cached in KV for 30 days; unknown IPs show as `🌐 未知` and are backfilled asynchronously.
+
+## 📄 License
+
+MIT — see [LICENSE](https://github.com/myth-li/shadowshuttle/blob/main/LICENSE).
+Stars ⭐, issues and PRs are welcome.
