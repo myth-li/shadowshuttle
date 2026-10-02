@@ -1793,23 +1793,302 @@ async function handlePostConfig(request, env) {
 }
 
 /* ------------------------------------------------------------------
+ * 请求日志（KV，最多保留 200 条，7 天过期）
+ * 记录：时间、客户端 IP、国家、路径、UA。面板可开关、查看。
+ * ------------------------------------------------------------------ */
+
+/** 追加一条请求日志 */
+export async function appendLog(env, entry) {
+  const kv = env.KV;
+  if (!kv) return;
+  try {
+    const raw = await kv.get(KV_LOG_KEY);
+    const arr = raw ? JSON.parse(raw) : [];
+    arr.push({ t: Date.now(), ...entry });
+    while (arr.length > 200) arr.shift();
+    await kv.put(KV_LOG_KEY, JSON.stringify(arr), { expirationTtl: 7 * 86400 });
+  } catch { /* 忽略 */ }
+}
+
+/** 读日志（倒序，最新的在前） */
+export async function getLogs(env, limit) {
+  const kv = env.KV;
+  if (!kv) return [];
+  try {
+    const raw = await kv.get(KV_LOG_KEY);
+    const arr = raw ? JSON.parse(raw) : [];
+    return arr.slice(-(limit || 100)).reverse();
+  } catch { return []; }
+}
+
+/** 从请求提取日志条目 */
+export function logEntryOf(request) {
+  const h = request.headers;
+  return {
+    ip: h.get('cf-connecting-ip') || '',
+    cc: h.get('cf-ipcountry') || '',
+    path: new URL(request.url).pathname,
+    ua: (h.get('user-agent') || '').slice(0, 120),
+  };
+}
+
+/* ------------------------------------------------------------------
+ * Telegram 推送（有人拉订阅 / 新 IP 建连时通知）
+ * ------------------------------------------------------------------ */
+
+/** 发 TG 消息（fire-and-forget，失败忽略） */
+export async function tgNotify(env, cfg, text) {
+  if (!cfg.tgEnabled || !cfg.tgBotToken || !cfg.tgChatId) return;
+  try {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 8000);
+    await fetch(`https://api.telegram.org/bot${cfg.tgBotToken}/sendMessage`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ chat_id: cfg.tgChatId, text: String(text).slice(0, 4000) }),
+      signal: ctrl.signal,
+    });
+    clearTimeout(timer);
+  } catch { /* 忽略 */ }
+}
+
+/** 代理建连的 TG 通知（每 IP 每天只推一次，避免刷屏） */
+export async function tgNotifyOncePerDay(env, cfg, ip, text) {
+  if (!cfg.tgEnabled || !cfg.tgBotToken || !cfg.tgChatId || !ip) return;
+  const kv = env.KV;
+  const key = KV_TGIP_PREFIX + ip;
+  try {
+    if (kv && (await kv.get(key))) return; // 今天已推过
+  } catch { /* 忽略 */ }
+  await tgNotify(env, cfg, text);
+  if (kv) {
+    try { await kv.put(key, '1', { expirationTtl: 86400 }); } catch { /* 忽略 */ }
+  }
+}
+
+/* ------------------------------------------------------------------
+ * Cloudflare Workers 用量查询（GraphQL，需 API Token + Account ID）
+ * 显示当日请求数，进度条上限 10 万/天（免费计划）。
+ * ------------------------------------------------------------------ */
+export async function fetchCfUsage(env, cfg) {
+  if (!cfg.cfApiToken || !cfg.cfAccountId) throw new Error('请先在面板配置 CF API Token 与 Account ID');
+  const today = new Date().toISOString().slice(0, 10);
+  const query = `query{viewer{accounts(filter:{accountTag:"${cfg.cfAccountId}"}){workersInvocationsAdaptive(limit:1000,filter:{date_gt:"${today}"}){sum{requests}}}}}`;
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 12000);
+  try {
+    const res = await fetch('https://api.cloudflare.com/client/v4/graphql', {
+      method: 'POST',
+      headers: { 'authorization': 'Bearer ' + cfg.cfApiToken, 'content-type': 'application/json' },
+      body: JSON.stringify({ query }),
+      signal: ctrl.signal,
+    });
+    clearTimeout(timer);
+    if (!res.ok) throw new Error('CF API 请求失败: ' + res.status);
+    const j = await res.json();
+    const accts = j && j.data && j.data.viewer && j.data.viewer.accounts;
+    const sum = accts && accts[0] && accts[0].workersInvocationsAdaptive && accts[0].workersInvocationsAdaptive[0];
+    const used = sum && sum.sum ? Number(sum.sum.requests) || 0 : 0;
+    return { used, limit: 100000, date: today };
+  } catch (e) {
+    clearTimeout(timer);
+    throw e;
+  }
+}
+
+/* ------------------------------------------------------------------
+ * 面板扩展 API（均需登录会话）
+ * ------------------------------------------------------------------ */
+
+/** GET /api/logs：查看请求日志 */
+async function handleLogs(env) {
+  return json({ logs: await getLogs(env, 100) });
+}
+
+/** GET /api/test-source?url=：一键验证优选源，返回抓到的 IP 数量与示例 */
+async function handleTestSource(env, url) {
+  const u = String(url || '').trim();
+  if (!/^(https?|sub):\/\//.test(u)) return json({ ok: false, error: 'URL 须以 https:// 或 sub:// 开头' });
+  try {
+    const ips = await fetchSourceIPs(u, env.KV);
+    return json({ ok: true, count: ips.length, sample: ips.slice(0, 5) });
+  } catch (e) {
+    return json({ ok: false, error: String(e && e.message || e) });
+  }
+}
+
+/** GET /api/cf-usage：查询 Workers 当日用量 */
+async function handleCfUsage(env, cfg) {
+  try {
+    const r = await fetchCfUsage(env, cfg);
+    return json({ ok: true, ...r });
+  } catch (e) {
+    return json({ ok: false, error: String(e && e.message || e) });
+  }
+}
+
+/** 经 socket 发最小 HTTP GET，读响应并提取 body（check-proxy 测出口 IP 用） */
+async function httpGetBodyViaSocket(sock, host, path) {
+  const w = sock.writable.getWriter();
+  const r = sock.readable.getReader();
+  try {
+    await w.write(te.encode(`GET ${path} HTTP/1.0\r\nHost: ${host}\r\nUser-Agent: shadowshuttle/2.0\r\n\r\n`));
+    try { w.releaseLock(); } catch { /* 忽略 */ }
+    let acc = new Uint8Array(0);
+    for (;;) {
+      const { done, value } = await r.read();
+      if (done) break;
+      if (value) acc = concatBytes(acc, value);
+      if (acc.length > 65536) break;
+    }
+    const text = td.decode(acc);
+    const idx = text.indexOf('\r\n\r\n');
+    return idx >= 0 ? text.slice(idx + 4).trim() : text.trim();
+  } finally {
+    try { r.cancel(); } catch { /* 忽略 */ }
+    try { sock.close(); } catch { /* 忽略 */ }
+  }
+}
+
+/** GET /api/check-proxy：经链式代理抓取 api.ipify.org，验证链路并显示出口 IP */
+async function handleCheckProxy(env, cfg) {
+  if (!cfg.chainEnabled || !cfg.chainHost) return json({ ok: false, error: '链式代理未启用' });
+  try {
+    // 走 80 端口做纯 HTTP 探测（避免在代理隧道内再套 TLS 的复杂度）
+    const sock = await dialViaChain('api.ipify.org', 80, cfg);
+    const body = await httpGetBodyViaSocket(sock, 'api.ipify.org', '/');
+    const ip = body.split('\n')[0].trim();
+    if (!isIP(ip)) throw new Error('出口 IP 解析失败: ' + body.slice(0, 60));
+    return json({ ok: true, ip, via: `${cfg.chainType}://${cfg.chainHost}:${cfg.chainPort}` });
+  } catch (e) {
+    return json({ ok: false, error: String(e && e.message || e) });
+  }
+}
+
+/* ------------------------------------------------------------------
  * 订阅接口
  * ------------------------------------------------------------------ */
-async function handleSub(env, ctx, cfg, host, format) {
+/* ------------------------------------------------------------------
+ * 订阅接口（v2）
+ * 流程：优选 IP 条目 → 归属地 → 节点命名 → 各格式生成。
+ *  ?sub=<url>：再聚合一个外部订阅的节点原文（base64 直接追加原文；
+ *    clash/singbox/surge/quanx/loon 尽力转换可解析的 vless/trojan/ss 链接）。
+ *  ?target= 或 UA 自动识别格式；显式路径（/clash 等）优先。
+ * ------------------------------------------------------------------ */
+async function handleSub(request, env, ctx, cfg, host, explicitFormat) {
   if (!cfg.UUID) return new Response('UUID 未配置', { status: 500 });
-  const ips = await getPreferredIPs(cfg, env);
+  const url = new URL(request.url);
+  const format = detectSubFormat(request, explicitFormat);
+  // 优选 IP 条目（含端口/备注）
+  const entries = await getPreferredIPs(cfg, env);
   const geoMap = {};
-  await Promise.all(ips.map(async (ip) => { geoMap[ip] = await getCachedGeo(ip, env); }));
+  await Promise.all(entries.map(async (e) => { geoMap[e.ip] = await getCachedGeo(e.ip, env); }));
   // 后台补齐缺失的归属地，不阻塞本次响应
-  ctx.waitUntil(refreshGeoCache(ips, env));
-  const nodes = buildNodeNames(ips, geoMap);
+  ctx.waitUntil(refreshGeoCache(entries.map((e) => e.ip), env));
+  const nodes = buildNodeNames(entries, geoMap);
+  // ?sub= 聚合外部订阅
+  const aggParam = url.searchParams.get('sub');
+  let aggLinks = [];
+  if (aggParam) {
+    try { aggLinks = await fetchAggSubLinks(aggParam); } catch { /* 忽略 */ }
+  }
+  // 日志 + TG（后台，不阻塞）
+  const le = logEntryOf(request);
+  if (cfg.logEnabled) ctx.waitUntil(appendLog(env, le));
+  if (cfg.tgEnabled) {
+    ctx.waitUntil(tgNotify(env, cfg,
+      `📥 有人拉取订阅\nIP: ${le.ip || '未知'}${le.cc ? ' (' + le.cc + ')' : ''}\n格式: ${format}\nUA: ${le.ua || '-'}\n时间: ${new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })}`));
+  }
+  const aggParsed = aggLinks.map(parseNodeLink).filter(Boolean);
   if (format === 'clash') {
-    return new Response(buildClashSub(nodes, cfg, host), { headers: { 'content-type': 'text/yaml; charset=utf-8' } });
+    return new Response(buildClashSub(nodes, cfg, host) + clashAgg(aggParsed), { headers: { 'content-type': 'text/yaml; charset=utf-8' } });
   }
   if (format === 'singbox') {
-    return new Response(buildSingboxSub(nodes, cfg, host), { headers: { 'content-type': 'application/json; charset=utf-8' } });
+    return new Response(mergeSingboxAgg(buildSingboxSub(nodes, cfg, host), aggParsed, cfg, host), { headers: { 'content-type': 'application/json; charset=utf-8' } });
   }
-  return new Response(buildBase64Sub(nodes, cfg, host), { headers: { 'content-type': 'text/plain; charset=utf-8' } });
+  if (format === 'surge') {
+    return new Response(buildSurgeSub(nodes, cfg, host) + surgeAgg(aggParsed), { headers: { 'content-type': 'text/plain; charset=utf-8' } });
+  }
+  if (format === 'quanx') {
+    return new Response(buildQuanxSub(nodes, cfg, host) + '\n' + quanxAgg(aggParsed), { headers: { 'content-type': 'text/plain; charset=utf-8' } });
+  }
+  if (format === 'loon') {
+    return new Response(buildLoonSub(nodes, cfg, host) + '\n' + loonAgg(aggParsed), { headers: { 'content-type': 'text/plain; charset=utf-8' } });
+  }
+  return new Response(buildBase64Sub(nodes, cfg, host, aggLinks), { headers: { 'content-type': 'text/plain; charset=utf-8' } });
+}
+
+/** 聚合节点 → clash proxies 段（尽力转换） */
+function clashAgg(list) {
+  if (!list.length) return '';
+  const L = [];
+  for (const n of list) {
+    const name = yamlStr(n.name);
+    if (n.proto === 'vless') {
+      L.push(`  - name: ${name}`, `    type: vless`, `    server: ${n.server}`, `    port: ${n.port}`,
+        `    uuid: ${n.id}`, `    tls: true`, `    network: ws`);
+    } else if (n.proto === 'trojan') {
+      L.push(`  - name: ${name}`, `    type: trojan`, `    server: ${n.server}`, `    port: ${n.port}`,
+        `    password: ${yamlStr(n.id)}`, `    network: ws`);
+    } else if (n.proto === 'ss' && n.method) {
+      L.push(`  - name: ${name}`, `    type: ss`, `    server: ${n.server}`, `    port: ${n.port}`,
+        `    cipher: ${n.method}`, `    password: ${yamlStr(n.password)}`);
+    }
+  }
+  return L.length ? L.join('\n') + '\n' : '';
+}
+
+/** 聚合节点并入 sing-box JSON */
+function mergeSingboxAgg(jsonStr, list, cfg, host) {
+  if (!list.length) return jsonStr;
+  try {
+    const j = JSON.parse(jsonStr);
+    for (const n of list) {
+      if (n.proto === 'vless') j.outbounds.push({ type: 'vless', tag: n.name, server: n.server, server_port: n.port, uuid: n.id });
+      else if (n.proto === 'trojan') j.outbounds.push({ type: 'trojan', tag: n.name, server: n.server, server_port: n.port, password: n.id });
+      else if (n.proto === 'ss' && n.method) j.outbounds.push({ type: 'shadowsocks', tag: n.name, server: n.server, server_port: n.port, method: n.method, password: n.password });
+    }
+    return JSON.stringify(j, null, 2);
+  } catch { return jsonStr; }
+}
+
+/** 聚合节点 → surge proxy 行（尽力转换） */
+function surgeAgg(list) {
+  if (!list.length) return '';
+  const L = [];
+  for (const n of list) {
+    const tag = n.name.replace(/,/g, ' ');
+    if (n.proto === 'vless') L.push(`${tag} = vless, ${n.server}, ${n.port}, username=${n.id}, tls=true`);
+    else if (n.proto === 'trojan') L.push(`${tag} = trojan, ${n.server}, ${n.port}, password=${n.id}`);
+    else if (n.proto === 'ss' && n.method) L.push(`${tag} = ss, ${n.server}, ${n.port}, encrypt-method=${n.method}, password=${n.password}`);
+  }
+  return L.length ? '\n' + L.join('\n') + '\n' : '';
+}
+
+/** 聚合节点 → quanx 行（尽力转换） */
+function quanxAgg(list) {
+  if (!list.length) return '';
+  const L = [];
+  for (const n of list) {
+    const tag = `tag=${n.name.replace(/,/g, ' ')}`;
+    if (n.proto === 'vless') L.push(`vless=${n.server}:${n.port}, method=none, password=${n.id}, tls=true, ${tag}`);
+    else if (n.proto === 'trojan') L.push(`trojan=${n.server}:${n.port}, password=${n.id}, over-tls=true, ${tag}`);
+    else if (n.proto === 'ss' && n.method) L.push(`shadowsocks=${n.server}:${n.port}, method=${n.method}, password=${n.password}, ${tag}`);
+  }
+  return L.join('\n');
+}
+
+/** 聚合节点 → loon 行（尽力转换） */
+function loonAgg(list) {
+  if (!list.length) return '';
+  const L = [];
+  for (const n of list) {
+    const tag = n.name.replace(/,/g, ' ');
+    if (n.proto === 'vless') L.push(`${tag} = VLESS,${n.server},${n.port},${n.id},udp=true,tls=true`);
+    else if (n.proto === 'trojan') L.push(`${tag} = Trojan,${n.server},${n.port},${n.id},udp=true`);
+    else if (n.proto === 'ss' && n.method) L.push(`${tag} = Shadowsocks,${n.server},${n.port},${n.method},"${n.password}",udp=true`);
+  }
+  return L.join('\n');
 }
 
 /* ------------------------------------------------------------------
@@ -2494,34 +2773,67 @@ export default {
     const host = url.host;
     const cfg = await loadConfig(env);
     const isWs = request.headers.get('Upgrade') === 'websocket';
+    const method = request.method;
 
     // 首页伪装
-    if (path === '/') return htmlResp(cfg.disguiseHTML || defaultDisguiseHTML());
+    if (path === '/' && method === 'GET') return htmlResp(cfg.disguiseHTML || defaultDisguiseHTML());
 
     // 登录页 / 登录登出 API（无需会话）
-    if (path === '/login' && request.method === 'GET') return htmlResp(loginPageHTML());
-    if (path === '/api/login' && request.method === 'POST') return handleLogin(request, env, cfg, url);
-    if (path === '/api/logout' && request.method === 'POST') return handleLogout(request, env);
+    if (path === '/login' && method === 'GET') return htmlResp(loginPageHTML());
+    if (path === '/api/login' && method === 'POST') return handleLogin(request, env, cfg, url);
+    if (path === '/api/logout' && method === 'POST') return handleLogout(request, env);
 
-    // 管理后台与配置 API（需要会话）
-    if (path === '/admin' || path === '/api/config') {
+    // 管理后台与面板 API（需要会话）
+    const needSession = path === '/admin' || path === '/api/config' ||
+      path === '/api/logs' || path === '/api/test-source' ||
+      path === '/api/cf-usage' || path === '/api/check-proxy';
+    if (needSession) {
       if (!(await checkSession(request, env))) {
         if (path === '/admin') return Response.redirect(new URL('/login', url).toString(), 302);
         return json({ error: 'unauthorized' }, 401);
       }
       if (path === '/admin') return htmlResp(adminPageHTML(cfg.subPath));
-      if (request.method === 'GET') return handleGetConfig(cfg, env);
-      if (request.method === 'POST') return handlePostConfig(request, env);
+      if (path === '/api/logs') return handleLogs(env);
+      if (path === '/api/test-source') return handleTestSource(env, url.searchParams.get('url'));
+      if (path === '/api/cf-usage') return handleCfUsage(env, cfg);
+      if (path === '/api/check-proxy') return handleCheckProxy(env, cfg);
+      if (method === 'GET') return handleGetConfig(cfg, env);
+      if (method === 'POST') return handlePostConfig(request, env);
       return new Response('method not allowed', { status: 405 });
     }
 
-    // 订阅（三种格式）
-    const subBase = cfg.subPath;
-    if (path === subBase || path === subBase + '/') return handleSub(env, ctx, cfg, host, 'base64');
-    if (path === subBase + '/clash') return handleSub(env, ctx, cfg, host, 'clash');
-    if (path === subBase + '/singbox') return handleSub(env, ctx, cfg, host, 'singbox');
+    // gRPC 传输：POST + application/grpc（/api/* 已在上面处理）
+    const ctype = request.headers.get('content-type') || '';
+    if (method === 'POST' && ctype.includes('application/grpc') && !path.startsWith('/api/')) {
+      logAndNotifyProxy(request, env, ctx, cfg, 'grpc');
+      return handleGrpc(request, env, cfg, ctx);
+    }
+    // XHTTP 传输（stream-one 基础模式）：POST + x-padding 头或 ?xhttp= 参数
+    if (method === 'POST' && !path.startsWith('/api/') &&
+        (request.headers.has('x-padding') || url.searchParams.has('xhttp'))) {
+      logAndNotifyProxy(request, env, ctx, cfg, 'xhttp');
+      return handleXhttp(request, env, cfg, ctx);
+    }
 
-    // WS 代理入口
+    // 订阅：主路径 + 显式格式路径 + 快速订阅 KEY 路径
+    // 格式按「显式路径 > ?target= > UA 嗅探」决定，handleSub 内统一处理
+    const subBase = cfg.subPath;
+    const subRoutes = [
+      [subBase, null], [subBase + '/', null],
+      [subBase + '/clash', 'clash'], [subBase + '/singbox', 'singbox'],
+      [subBase + '/surge', 'surge'], [subBase + '/quanx', 'quanx'], [subBase + '/loon', 'loon'],
+    ];
+    if (cfg.subKey) {
+      const kb = '/' + cfg.subKey;
+      subRoutes.push([kb, null], [kb + '/', null],
+        [kb + '/clash', 'clash'], [kb + '/singbox', 'singbox'],
+        [kb + '/surge', 'surge'], [kb + '/quanx', 'quanx'], [kb + '/loon', 'loon']);
+    }
+    for (const [p, f] of subRoutes) {
+      if (path === p) return handleSub(request, env, ctx, cfg, host, f);
+    }
+
+    // WS 代理入口（按首包形状自动识别协议，v1 行为保留）
     if (isWs) {
       const seg = path.slice(1);
       const run = (fn) => {
@@ -2533,14 +2845,17 @@ export default {
       };
       if (seg === 'trojan') {
         if (!cfg.trojanPassword) return new Response('trojan disabled', { status: 404 });
+        logAndNotifyProxy(request, env, ctx, cfg, 'trojan');
         return run((s) => handleTrojan(s, request, env, cfg));
       }
       if (seg === 'ss') {
         if (!cfg.ssPassword) return new Response('ss disabled', { status: 404 });
+        logAndNotifyProxy(request, env, ctx, cfg, 'ss');
         return run((s) => handleSs(s, request, env, cfg));
       }
       if (parseUUID(seg)) {
         if (!cfg.UUID) return new Response('uuid not configured', { status: 500 });
+        logAndNotifyProxy(request, env, ctx, cfg, 'vless');
         return run((s) => handleVless(s, request, env, cfg));
       }
     }
@@ -2548,3 +2863,16 @@ export default {
     return new Response('Not Found', { status: 404 });
   },
 };
+
+/** 代理建连的日志 + TG 通知（后台，不阻塞；TG 每 IP 每天一次） */
+function logAndNotifyProxy(request, env, ctx, cfg, proto) {
+  try {
+    const le = logEntryOf(request);
+    le.path = `proxy:${proto}`;
+    if (cfg.logEnabled) ctx.waitUntil(appendLog(env, le));
+    if (cfg.tgEnabled && le.ip) {
+      ctx.waitUntil(tgNotifyOncePerDay(env, cfg, le.ip,
+        `🔗 新代理连接\n协议: ${proto}\nIP: ${le.ip}${le.cc ? ' (' + le.cc + ')' : ''}\nUA: ${le.ua || '-'}`));
+    }
+  } catch { /* 忽略 */ }
+}
