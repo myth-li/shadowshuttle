@@ -725,6 +725,9 @@ const DEFAULT_CONFIG = {
   randIPPort: 443,          // 随机优选 IP 端口
   // —— 出站 ——
   proxyIP: '',              // 回落 IP（出站失败时重试）
+  dialRace: false,          // 并发拨号：同时拨直连/链式/回落，取最快成功的（默认关闭，保持串行）
+  dialConcurrency: 3,       // 并发拨号数（2-5）
+  dialTimeoutMs: 0,         // 单次拨号超时 ms（0=自适应：按历史耗时动态调整）
   chainEnabled: false,      // 链式代理开关
   chainType: 'socks5',      // socks5 / http / https
   chainHost: '',            // 链式代理地址
@@ -790,12 +793,15 @@ export async function loadConfig(env) {
   cfg.randIPCount = clampInt(cfg.randIPCount, 0, 500, 16);
   cfg.ssAltPort = clampInt(cfg.ssAltPort, 0, 65535, 0);
   cfg.chainPort = clampPort(cfg.chainPort, 1080);
+  cfg.dialConcurrency = clampInt(cfg.dialConcurrency, 2, 5, 3);
+  cfg.dialTimeoutMs = clampInt(cfg.dialTimeoutMs, 0, 30000, 0);
   if (!SS_METHODS[cfg.ssMethod]) cfg.ssMethod = 'aes-128-gcm';
   if (!['socks5', 'http', 'https'].includes(cfg.chainType)) cfg.chainType = 'socks5';
   cfg.subKey = String(cfg.subKey || '').trim().replace(/^\/+|\/+$/g, '');
   cfg.earlyData = !!cfg.earlyData;
   cfg.fragment = !!cfg.fragment;
   cfg.chainEnabled = !!cfg.chainEnabled;
+  cfg.dialRace = !!cfg.dialRace;
   cfg.logEnabled = !!cfg.logEnabled;
   cfg.tgEnabled = !!cfg.tgEnabled;
   // env 兜底
@@ -851,6 +857,9 @@ export async function saveConfig(env, input) {
   cfg.chainUser = String(input.chainUser || '');
   cfg.chainPass = String(input.chainPass || '');
   cfg.chainWhitelist = linesToList(input.chainWhitelist);
+  cfg.dialRace = !!input.dialRace;
+  cfg.dialConcurrency = clampInt(input.dialConcurrency, 2, 5, 3);
+  cfg.dialTimeoutMs = clampInt(input.dialTimeoutMs, 0, 30000, 0);
   cfg.logEnabled = !!input.logEnabled;
   cfg.tgEnabled = !!input.tgEnabled;
   cfg.tgBotToken = String(input.tgBotToken || '').trim();
@@ -2091,6 +2100,7 @@ function adminApp(SUB_INIT) {
     ['preferredSources', 'ta'], ['preferredStatic', 'ta'], ['randIPCount', 'n'], ['randIPPort', 'n'],
     ['proxyIP', 't'], ['chainEnabled', 'b'], ['chainType', 'pill'], ['chainHost', 't'], ['chainPort', 'n'],
     ['chainUser', 't'], ['chainPass', 't'], ['chainWhitelist', 'ta'],
+    ['dialRace', 'b'], ['dialConcurrency', 'n'], ['dialTimeoutMs', 'n'],
     ['hosts', 'ta'], ['nodePort', 'n'], ['subKey', 't'], ['earlyData', 'b'], ['fragment', 'b'],
     ['disguiseHTML', 'ta'],
     ['logEnabled', 'b'], ['tgEnabled', 'b'], ['tgBotToken', 't'], ['tgChatId', 't'],
@@ -2468,6 +2478,9 @@ export function adminPageHTML(subPath) {
     srow('👤', '链式用户', fText('chainUser', '无认证可留空')) +
     srow('🔑', '链式密码', fPass('chainPass', '')) +
     srow('📋', '白名单', fArea('chainWhitelist', '每行一个域名', 3), '命中白名单的域名直连，不走链式代理') +
+    srow('🏁', '并发拨号', fTgl('dialRace'), '同时拨直连/链式/回落，取最快成功的') +
+    srow('🔢', '并发数', fNum('dialConcurrency', '3'), '2-5') +
+    srow('⏱️', '拨号超时', fNum('dialTimeoutMs', '0'), '毫秒；0=自适应（弱网自动收紧超时）') +
     '<div style="margin:10px 0 4px"><button class="btn btn-ghost btn-sm" id="chainTestBtn">🔍 检查链式代理</button></div>' +
     '<div id="chainTestRes"></div>') +
   dCard('card-sub', '📄', '订阅参数',
@@ -2632,6 +2645,9 @@ function handleGetConfig(cfg, env) {
     chainUser: cfg.chainUser,
     chainPass: '', // 密码不回显，前端留空=不修改
     chainWhitelist: cfg.chainWhitelist,
+    dialRace: cfg.dialRace,
+    dialConcurrency: cfg.dialConcurrency,
+    dialTimeoutMs: cfg.dialTimeoutMs,
     logEnabled: cfg.logEnabled,
     tgEnabled: cfg.tgEnabled,
     tgBotToken: '', // Token 不回显
@@ -3179,20 +3195,139 @@ async function dialViaChain(addr, port, cfg) {
   return httpProxyDial(cfg, addr, port);
 }
 
-/** 统一出站拨号：直连 → 链式代理 → PROXYIP 回落，逐个尝试 */
-async function dialOut(addr, port, cfg) {
+/* ------------------------------------------------------------------
+ * 拨号调优（v3）：并发竞速 + 自适应超时
+ * ------------------------------------------------------------------ */
+
+/** 纯函数：按配置排出拨号尝试顺序（链式→直连→回落）。
+ * 抽出来一是单测可覆盖顺序逻辑，二是串行/并发两种模式共用一份顺序。 */
+export function buildDialPlan(addr, cfg) {
+  const plan = [];
   const chainOk = cfg.chainEnabled && cfg.chainHost;
   const chainFirst = chainOk && chainAllows(cfg, addr);
-  const attempts = [];
-  if (chainFirst) attempts.push(() => dialViaChain(addr, port, cfg));
-  attempts.push(() => tcpConnect(addr, port));
-  if (chainOk && !chainFirst) attempts.push(() => dialViaChain(addr, port, cfg));
-  if (cfg.proxyIP) attempts.push(() => tcpConnect(cfg.proxyIP, 443));
-  let err = null;
-  for (const fn of attempts) {
-    try { return await fn(); } catch (e) { err = e; }
+  if (chainFirst) plan.push({ kind: 'chain' });
+  plan.push({ kind: 'direct' });
+  if (chainOk && !chainFirst) plan.push({ kind: 'chain' });
+  if (cfg.proxyIP) plan.push({ kind: 'proxyip' });
+  return plan;
+}
+
+/** 按计划项实际拨号 */
+function dialByKind(kind, addr, port, cfg) {
+  if (kind === 'chain') return dialViaChain(addr, port, cfg);
+  if (kind === 'proxyip') return tcpConnect(cfg.proxyIP, 443);
+  return tcpConnect(addr, port);
+}
+
+/** 自适应拨号超时（纯函数，可单测）。
+ * 思路：平时按历史平均耗时的 2 倍给超时；弱网（失败数超过成功数）时收紧到
+ * 平均耗时——因为弱网下"等一个注定失败的拨号"最浪费时间，快速失败、
+ * 快速试下一条反而更快建连；网络正常时给足 2 倍余量避免误杀慢但可用的链路。
+ * 上下限钳制（1200~8000ms）防止极端值。 */
+export function computeDialTimeout(manualMs, avgMs, okCount, failCount) {
+  if (manualMs > 0) return manualMs; // 面板手动指定优先
+  const avg = avgMs > 0 ? avgMs : 3000; // 无历史时按 3s 估
+  const weak = failCount > okCount;     // 失败比成功多 → 视为弱网
+  const t = weak ? Math.min(avg, 2500) : avg * 2;
+  return Math.min(8000, Math.max(1200, Math.round(t)));
+}
+
+// 模块级拨号统计（同 isolate 内共享；Workers 无跨请求持久内存，尽力而为）
+const dialStats = { ok: 0, fail: 0, totalMs: 0 };
+/** 记录一次拨号结果：ms=null 表示失败 */
+export function noteDialResult(ms) {
+  if (ms == null) { dialStats.fail++; }
+  else { dialStats.ok++; dialStats.totalMs += ms; }
+  if (dialStats.ok + dialStats.fail > 10000) { // 防溢出：衰减
+    dialStats.ok = Math.floor(dialStats.ok / 2);
+    dialStats.fail = Math.floor(dialStats.fail / 2);
+    dialStats.totalMs = Math.floor(dialStats.totalMs / 2);
   }
-  throw err || new Error('dial failed');
+}
+/** 当前配置下的拨号超时（供 raceDials 用） */
+export function dialTimeoutFor(cfg) {
+  const avg = dialStats.ok ? dialStats.totalMs / dialStats.ok : 0;
+  return computeDialTimeout(cfg.dialTimeoutMs, avg, dialStats.ok, dialStats.fail);
+}
+
+/** 并发竞速拨号（纯逻辑，可单测，fn 返回类 socket {close()}）。
+ * 同时发起多个拨号，取最快成功的；落败或超时的尝试会被关闭，避免泄漏。
+ * 注意：超时的尝试底层 connect 可能稍后才成功，通过 side-tap 统一关闭。 */
+export async function raceDials(fns, timeoutMs) {
+  if (!fns.length) throw new Error('no dial attempts');
+  const sockets = [];
+  let settled = false;
+  return await new Promise((resolve, reject) => {
+    let pending = fns.length;
+    let lastErr = null;
+    const finish = (sock) => {
+      if (settled) { try { sock.close(); } catch { /* 忽略 */ } return; }
+      settled = true;
+      for (const s of sockets) if (s !== sock) { try { s.close(); } catch { /* 忽略 */ } }
+      resolve(sock);
+    };
+    fns.forEach((fn) => {
+      let timer = null;
+      const p = fn();
+      // side-tap：任何尝试只要建连成功就登记；若已决出胜负，立即关闭（防泄漏）
+      p.then((s) => {
+        sockets.push(s);
+        if (settled) { try { s.close(); } catch { /* 忽略 */ } }
+      }, () => {});
+      (async () => {
+        try {
+          const sock = timeoutMs > 0
+            ? await Promise.race([p, new Promise((_, rej) => {
+                timer = setTimeout(() => rej(new Error('dial timeout')), timeoutMs);
+              })])
+            : await p;
+          if (timer) clearTimeout(timer);
+          finish(sock);
+        } catch (e) {
+          if (timer) clearTimeout(timer);
+          lastErr = e;
+          if (--pending === 0 && !settled) { settled = true; reject(lastErr); }
+        }
+      })();
+    });
+  });
+}
+
+/** 统一出站拨号。
+ * dialRace 关闭（默认）：串行逐个尝试（v1/v2 原有行为，稳定优先）。
+ * dialRace 开启：前 N 个尝试并发竞速取最快成功的；若全败，剩余的串行补试
+ * （比如 proxyip 回落），保证回落语义不丢。 */
+async function dialOut(addr, port, cfg) {
+  const plan = buildDialPlan(addr, cfg);
+  const timed = async (kind) => {
+    const t0 = Date.now();
+    try {
+      const sock = await dialByKind(kind, addr, port, cfg);
+      noteDialResult(Date.now() - t0);
+      return sock;
+    } catch (e) {
+      noteDialResult(null);
+      throw e;
+    }
+  };
+  if (!cfg.dialRace || plan.length < 2) {
+    let err = null;
+    for (const step of plan) {
+      try { return await timed(step.kind); } catch (e) { err = e; }
+    }
+    throw err || new Error('dial failed');
+  }
+  const n = Math.min(plan.length, clampInt(cfg.dialConcurrency, 2, 5, 3));
+  const timeoutMs = dialTimeoutFor(cfg);
+  try {
+    return await raceDials(plan.slice(0, n).map((s) => () => timed(s.kind)), timeoutMs);
+  } catch (e) {
+    let err = e;
+    for (const step of plan.slice(n)) {
+      try { return await timed(step.kind); } catch (e2) { err = e2; }
+    }
+    throw err;
+  }
 }
 
 // 旧名保留兼容（内部已统一走 dialOut）

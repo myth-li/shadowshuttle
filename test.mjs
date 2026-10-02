@@ -19,6 +19,7 @@ import {
   grpcEncode, grpcDecode,
   socks5Greeting, socks5AuthRequest, socks5ConnectRequest, expandIPv6, socks5CheckReply,
   buildHttpConnectReq, indexOfSeq, chainAllows, chainNeedsTls,
+  buildDialPlan, computeDialTimeout, raceDials,
   clampPort, clampInt,
 } from './_worker.js';
 import { createHash, createCipheriv, createDecipheriv, hkdfSync, randomBytes } from 'node:crypto';
@@ -336,6 +337,41 @@ console.log('[19] HTTPS 链式代理判定');
   ok('http 不需要 TLS', chainNeedsTls({ chainType: 'http' }) === false);
   ok('socks5 不需要 TLS', chainNeedsTls({ chainType: 'socks5' }) === false);
   ok('空配置不崩', chainNeedsTls(null) === false && chainNeedsTls({}) === false);
+}
+
+console.log('[20] 拨号计划 / 自适应超时 / 并发竞速');
+{
+  const kinds = (p) => p.map((s) => s.kind).join(',');
+  // 计划顺序
+  eq('无链无回落', kinds(buildDialPlan('a.com', {})), 'direct');
+  eq('链优先', kinds(buildDialPlan('a.com', { chainEnabled: true, chainHost: 'p.com' })), 'chain,direct');
+  eq('白名单未命中链置后', kinds(buildDialPlan('a.com', { chainEnabled: true, chainHost: 'p.com', chainWhitelist: ['x.com'] })), 'direct,chain');
+  eq('回落最后', kinds(buildDialPlan('a.com', { proxyIP: '1.2.3.4' })), 'direct,proxyip');
+  // 自适应超时
+  eq('手动优先', computeDialTimeout(4000, 1000, 10, 0), 4000);
+  eq('正常=2倍均值', computeDialTimeout(0, 1000, 10, 1), 2000);
+  eq('弱网收紧', computeDialTimeout(0, 2000, 2, 9), 2000);
+  eq('弱网下限', computeDialTimeout(0, 300, 0, 5), 1200);
+  eq('上限钳制', computeDialTimeout(0, 9000, 10, 0), 8000);
+  eq('无历史默认', computeDialTimeout(0, 0, 0, 0), 6000);
+  // 并发竞速：快者胜，慢者被关闭
+  const mkSock = (id, closed) => ({ id, close() { closed.push(id); } });
+  const closed = [];
+  const fast = () => new Promise((res) => setTimeout(() => res(mkSock('fast', closed)), 10));
+  const slow = () => new Promise((res) => setTimeout(() => res(mkSock('slow', closed)), 200));
+  const winner = await raceDials([slow, fast], 1000);
+  eq('竞速胜者', winner.id, 'fast');
+  await new Promise((r) => setTimeout(r, 300)); // 等慢者建连后被关闭
+  ok('落败者被关闭', closed.includes('slow'));
+  // 全败时抛错
+  const bad = () => Promise.reject(new Error('nope'));
+  let threw = false;
+  try { await raceDials([bad, bad], 500); } catch (e) { threw = /nope/.test(e.message); }
+  ok('全败抛错', threw);
+  // 超时计入失败
+  let threw2 = false;
+  try { await raceDials([slow], 30); } catch (e) { threw2 = /timeout/.test(e.message); }
+  ok('超时抛错', threw2);
 }
 
 console.log(`\n结果：${pass} 通过，${fail} 失败`);
