@@ -21,6 +21,7 @@ import {
   buildHttpConnectReq, indexOfSeq, chainAllows, chainNeedsTls,
   buildDialPlan, computeDialTimeout, raceDials,
   parseTrojanFallback,
+  isSpeedtestTarget, rotatedSubToken, utcToday, localEchoSocket,
   clampPort, clampInt,
 } from './_worker.js';
 import { createHash, createCipheriv, createDecipheriv, hkdfSync, randomBytes } from 'node:crypto';
@@ -398,6 +399,36 @@ console.log('[22] Trojan fallback 路径解析');
   eq('端口越界拒绝', parseTrojanFallback('trojan=1.1.1.1:99999'), null);
   eq('普通路径拒绝', parseTrojanFallback('trojan'), null);
   eq('空拒绝', parseTrojanFallback(''), null);
+}
+
+console.log('[23] 测速模式 / Token 轮换');
+{
+  const L = ['speedtest.net', 'speed.cloudflare.com', 'fast.com'];
+  ok('精确命中', isSpeedtestTarget('speedtest.net', L));
+  ok('子域命中', isSpeedtestTarget('www.speedtest.net', L));
+  ok('大小写不敏感', isSpeedtestTarget('WWW.SPEEDTEST.NET', L));
+  ok('未命中', !isSpeedtestTarget('google.com', L));
+  ok('空名单=关闭', !isSpeedtestTarget('speedtest.net', []));
+  ok('空host', !isSpeedtestTarget('', L));
+  ok('通配写法', isSpeedtestTarget('a.fast.com', ['*.fast.com']));
+  // token 轮换
+  eq('关闭=原样', rotatedSubToken('abc123', '2026-10-03', false), 'abc123');
+  const r1 = rotatedSubToken('abc123', '2026-10-03', true);
+  eq('开启=32位hex', /^[0-9a-f]{32}$/.test(r1), true);
+  eq('同日期确定', rotatedSubToken('abc123', '2026-10-03', true), r1);
+  ok('换日期变化', rotatedSubToken('abc123', '2026-10-04', true) !== r1);
+  ok('换base变化', rotatedSubToken('xyz789', '2026-10-03', true) !== r1);
+  ok('utcToday 格式', /^\d{4}-\d{2}-\d{2}$/.test(utcToday()));
+  // 本地回显（注意：TransformStream 默认 readable highWaterMark=0，
+  // 必须先发起 read 再 write，否则 write 会等 readable 被消费而挂起）
+  const echo = localEchoSocket();
+  const w = echo.writable.getWriter();
+  const r = echo.readable.getReader();
+  const readP = r.read();
+  await w.write(new TextEncoder().encode('ping'));
+  const got = await readP;
+  eq('回显内容', new TextDecoder().decode(got.value), 'ping');
+  w.releaseLock(); r.releaseLock(); echo.close();
 }
 
 console.log(`\n结果：${pass} 通过，${fail} 失败`);

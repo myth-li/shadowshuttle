@@ -693,6 +693,28 @@ export class WsReader {
 }
 
 /* ------------------------------------------------------------------
+ * 订阅 token 每日轮换（v3）
+ * ------------------------------------------------------------------ */
+
+/** 今天的 UTC 日期（YYYY-MM-DD）。
+ * 用 UTC 而不用本地时区：Workers 边缘节点遍布全球，同一时刻各地日期可能
+ * 不同；统一用 UTC 才能保证全球客户端在同一天算出同一个 token。 */
+export function utcToday(d) {
+  return (d || new Date()).toISOString().slice(0, 10);
+}
+
+/** 订阅 token 每日派生（纯函数）。
+ * 为什么：固定 token 一旦泄露（转发/截图/仓库误提交）就长期有效，任何人
+ * 都能拉你的订阅。开启轮换后，每天按日期派生不同 token
+ * （sha256(固定token + "|" + YYYY-MM-DD) 取前 32 位 hex），旧链接次日自动
+ * 失效。代价是每天要重新复制订阅链接，所以默认关闭，需要的用户手动开。
+ * enabled=false 时原样返回 base，保证关闭=零行为变化。 */
+export function rotatedSubToken(base, dateStr, enabled) {
+  if (!enabled) return base;
+  return bytesToHex(sha256Bytes(`${base}|${dateStr}`)).slice(0, 32);
+}
+
+/* ------------------------------------------------------------------
  * 配置模型
  * Worker Variables（必填）：ADMIN / UUID / SUB_TOKEN
  * 其余可选项存 KV（key: ss:config），Variables 做兜底。
@@ -714,6 +736,7 @@ const DEFAULT_CONFIG = {
   ssAltPort: 0,             // SS 非 TLS 备用端口（0=关闭，如 80）
   // —— 订阅 ——
   subKey: '',               // 快速订阅路径 KEY（空=不启用），/{KEY} 直达订阅
+  subTokenRotate: false,    // 订阅 token 每日轮换（默认关闭；开启后每天派生新 token）
   hosts: [],                // 多 HOST 轮换（空=用请求 host）
   nodePort: 443,            // 节点端口
   earlyData: false,         // 0RTT：订阅拼 ed=2048 参数
@@ -725,6 +748,8 @@ const DEFAULT_CONFIG = {
   randIPPort: 443,          // 随机优选 IP 端口
   // —— 出站 ——
   proxyIP: '',              // 回落 IP（出站失败时重试）
+  speedtestDomains: ['speedtest.net', 'speed.cloudflare.com', 'fast.com'],
+  // 测速域名名单（后缀匹配；清空=关闭测速模式）
   dialRace: false,          // 并发拨号：同时拨直连/链式/回落，取最快成功的（默认关闭，保持串行）
   dialConcurrency: 3,       // 并发拨号数（2-5）
   dialTimeoutMs: 0,         // 单次拨号超时 ms（0=自适应：按历史耗时动态调整）
@@ -788,6 +813,7 @@ export async function loadConfig(env) {
   cfg.preferredStatic = linesToList(cfg.preferredStatic);
   cfg.hosts = linesToList(cfg.hosts);
   cfg.chainWhitelist = linesToList(cfg.chainWhitelist);
+  cfg.speedtestDomains = linesToList(cfg.speedtestDomains); // linesToList 兼容数组与文本
   cfg.nodePort = clampPort(cfg.nodePort, 443);
   cfg.randIPPort = clampPort(cfg.randIPPort, 443);
   cfg.randIPCount = clampInt(cfg.randIPCount, 0, 500, 16);
@@ -802,6 +828,7 @@ export async function loadConfig(env) {
   cfg.fragment = !!cfg.fragment;
   cfg.chainEnabled = !!cfg.chainEnabled;
   cfg.dialRace = !!cfg.dialRace;
+  cfg.subTokenRotate = !!cfg.subTokenRotate;
   cfg.logEnabled = !!cfg.logEnabled;
   cfg.tgEnabled = !!cfg.tgEnabled;
   // env 兜底
@@ -809,7 +836,9 @@ export async function loadConfig(env) {
   cfg.UUID = env.UUID || '';
   cfg.SUB_TOKEN = env.SUB_TOKEN || '';
   cfg.subPathCustom = String(cfg.subPath || '').trim(); // 面板回显用（未改动前为空）
-  cfg.subPath = cfg.subPathCustom || (cfg.SUB_TOKEN ? `/${cfg.SUB_TOKEN}` : '/sub');
+  // 订阅路径：自定义 >（轮换派生/固定 token）> /sub
+  const effToken = rotatedSubToken(cfg.SUB_TOKEN, utcToday(), cfg.subTokenRotate);
+  cfg.subPath = cfg.subPathCustom || (effToken ? `/${effToken}` : '/sub');
   if (!cfg.subPath.startsWith('/')) cfg.subPath = '/' + cfg.subPath;
   return cfg;
 }
@@ -841,6 +870,7 @@ export async function saveConfig(env, input) {
   cfg.ssMethod = SS_METHODS[input.ssMethod] ? input.ssMethod : 'aes-128-gcm';
   cfg.ssAltPort = clampInt(input.ssAltPort, 0, 65535, 0);
   cfg.subKey = String(input.subKey || '').trim().replace(/^\/+|\/+$/g, '');
+  cfg.subTokenRotate = !!input.subTokenRotate;
   cfg.hosts = linesToList(input.hosts);
   cfg.nodePort = clampPort(input.nodePort, 443);
   cfg.earlyData = !!input.earlyData;
@@ -850,6 +880,7 @@ export async function saveConfig(env, input) {
   cfg.randIPCount = clampInt(input.randIPCount, 0, 500, 16);
   cfg.randIPPort = clampPort(input.randIPPort, 443);
   cfg.proxyIP = isIP(String(input.proxyIP || '').trim()) ? String(input.proxyIP).trim() : '';
+  cfg.speedtestDomains = linesToList(input.speedtestDomains);
   cfg.chainEnabled = !!input.chainEnabled;
   cfg.chainType = ['socks5', 'http', 'https'].includes(input.chainType) ? input.chainType : 'socks5';
   cfg.chainHost = String(input.chainHost || '').trim();
@@ -2098,10 +2129,10 @@ function adminApp(SUB_INIT) {
   var FIELDS = [
     ['multiUUID', 'ta'], ['trojanPassword', 't'], ['ssPassword', 't'], ['ssMethod', 'sel'], ['ssAltPort', 'n'],
     ['preferredSources', 'ta'], ['preferredStatic', 'ta'], ['randIPCount', 'n'], ['randIPPort', 'n'],
-    ['proxyIP', 't'], ['chainEnabled', 'b'], ['chainType', 'pill'], ['chainHost', 't'], ['chainPort', 'n'],
+    ['proxyIP', 't'], ['speedtestDomains', 'ta'], ['chainEnabled', 'b'], ['chainType', 'pill'], ['chainHost', 't'], ['chainPort', 'n'],
     ['chainUser', 't'], ['chainPass', 't'], ['chainWhitelist', 'ta'],
     ['dialRace', 'b'], ['dialConcurrency', 'n'], ['dialTimeoutMs', 'n'],
-    ['hosts', 'ta'], ['nodePort', 'n'], ['subKey', 't'], ['earlyData', 'b'], ['fragment', 'b'],
+    ['hosts', 'ta'], ['nodePort', 'n'], ['subKey', 't'], ['subTokenRotate', 'b'], ['earlyData', 'b'], ['fragment', 'b'],
     ['disguiseHTML', 'ta'],
     ['logEnabled', 'b'], ['tgEnabled', 'b'], ['tgBotToken', 't'], ['tgChatId', 't'],
     ['cfApiToken', 't'], ['cfAccountId', 't']
@@ -2470,6 +2501,7 @@ export function adminPageHTML(subPath) {
     true) +
   dCard('card-chain', '🔗', '出站与回落',
     srow('🛡️', '回落 IP', fText('proxyIP', '如 1.2.3.4'), '出站失败时回落重试一次') +
+    srow('🚀', '测速域名', fArea('speedtestDomains', '每行一个域名', 3), '命中则本地回显测速（不经过出站）；清空=关闭') +
     srow('🔗', '链式代理', fTgl('chainEnabled'), '开启后出站经由下方的代理服务器') +
     srow('📡', '链式类型', fPills('chainType',
       [['socks5', 'socks5'], ['http', 'http'], ['https', 'https']])) +
@@ -2487,6 +2519,7 @@ export function adminPageHTML(subPath) {
     srow('🌍', '订阅 HOST', fArea('hosts', '每行一个域名', 2), '多 HOST 轮换，订阅页可切换') +
     srow('🔌', '节点端口', fNum('nodePort', '443')) +
     srow('🗝️', '订阅 KEY', fText('subKey', '快速订阅路径 KEY'), '留空则使用默认订阅路径') +
+    srow('🔄', 'Token 日轮换', fTgl('subTokenRotate'), '开启后订阅 token 每天变化，旧链接次日失效（防泄露）') +
     srow('⚡', '0RTT', fTgl('earlyData'), 'Early Data（0RTT），需客户端支持') +
     srow('🧱', 'TLS 分片', fTgl('fragment'), '需客户端支持')) +
   dCard('card-disguise', '🎭', '伪装首页',
@@ -2629,6 +2662,7 @@ function handleGetConfig(cfg, env) {
     ssMethod: cfg.ssMethod,
     ssAltPort: cfg.ssAltPort,
     subKey: cfg.subKey,
+    subTokenRotate: cfg.subTokenRotate,
     hosts: cfg.hosts,
     nodePort: cfg.nodePort,
     earlyData: cfg.earlyData,
@@ -2638,6 +2672,7 @@ function handleGetConfig(cfg, env) {
     randIPCount: cfg.randIPCount,
     randIPPort: cfg.randIPPort,
     proxyIP: cfg.proxyIP,
+    speedtestDomains: cfg.speedtestDomains,
     chainEnabled: cfg.chainEnabled,
     chainType: cfg.chainType,
     chainHost: cfg.chainHost,
@@ -3335,6 +3370,47 @@ async function tcpConnectWithFallback(addr, port, cfg) {
   return dialOut(addr, port, cfg);
 }
 
+/* ------------------------------------------------------------------
+ * 测速模式（v3）：目标命中测速名单 → 本地回显，不经过出站
+ * ------------------------------------------------------------------ */
+
+/** 测速目标判定（纯函数）：host 命中名单则走本地回显。
+ * 后缀匹配（speedtest.net 能命中 www.speedtest.net），空名单=关闭测速模式。
+ * 注意与 chainAllows 的区别：chainAllows 空名单=全部走链，这里空名单=全不命中。 */
+export function isSpeedtestTarget(host, list) {
+  const t = String(host || '').toLowerCase().trim();
+  if (!t || !list || !list.length) return false;
+  return list.some((w) => {
+    const s = String(w || '').toLowerCase().trim().replace(/^\*\./, '');
+    return s && (t === s || t.endsWith('.' + s));
+  });
+}
+
+/** 本地回显 socket（测速模式用）。
+ * 为什么：客户端测速真正关心的是"客户端↔Worker"这段链路的吞吐；让 Worker
+ * 把收到的数据原样返回，测到的是真实可用带宽，且不消耗出站、不依赖测速站
+ * 本身的速度（测速站限速/排队会导致误判节点慢）。
+ * 实现：TransformStream 默认就是恒等变换，写进 writable 的数据会原样出现在
+ * readable 上——天然就是个回显器；接口与 TCP socket 的 readable/writable/
+ * close 一致，bridgeWsTcp 无需任何改动。 */
+export function localEchoSocket() {
+  const ts = new TransformStream();
+  return {
+    readable: ts.readable,
+    writable: ts.writable,
+    close() { try { ts.writable.close(); } catch { /* 忽略 */ } },
+  };
+}
+
+/** 出站建连统一入口（含测速模式）。
+ * 目标地址命中测速名单 → 返回本地回显（不拨号）；否则走正常拨号流程。
+ * 注意：Trojan fallback 的透传目标不走这里（那是用户自建服务器地址，
+ * 不是代理目标），直接用 dialOut。 */
+async function dialForTarget(addr, port, cfg) {
+  if (isSpeedtestTarget(addr, cfg.speedtestDomains)) return localEchoSocket();
+  return tcpConnectWithFallback(addr, port, cfg);
+}
+
 /** 从 Sec-WebSocket-Protocol 头取 early data（base64） */
 function getEarlyData(request) {
   const h = request.headers.get('sec-websocket-protocol');
@@ -3504,7 +3580,7 @@ async function handleVless(server, request, env, cfg) {
     const reader = new WsReader(ws);
     const hdr = await readHeader(reader, (b) => parseVlessHeader(b, validUUIDs), getEarlyData(request));
     if (hdr.cmd === 0x02) { await handleVlessUdp(ws, reader, hdr); return; }
-    const socket = await tcpConnectWithFallback(hdr.addr, hdr.port, cfg);
+    const socket = await dialForTarget(hdr.addr, hdr.port, cfg);
     await bridgeWsTcp(ws, socket, reader, { prefix: new Uint8Array([hdr.version, 0x00]) });
   } catch {
     try { ws.close(); } catch { /* 忽略 */ }
@@ -3569,7 +3645,7 @@ async function handleTrojan(server, request, env, cfg, fallback) {
       if (fallback && hdr.raw) { await pipeTrojanToFallback(ws, reader, hdr.raw, fallback, cfg); return; }
       await handleTrojanUdp(ws, reader); return;
     }
-    const socket = await tcpConnectWithFallback(hdr.addr, hdr.port, cfg);
+    const socket = await dialForTarget(hdr.addr, hdr.port, cfg);
     await bridgeWsTcp(ws, socket, reader, {});
   } catch {
     try { ws.close(); } catch { /* 忽略 */ }
@@ -3603,7 +3679,7 @@ async function handleSs(server, request, env, cfg) {
       }
       if (plain.length > 512) return;
     }
-    const socket = await tcpConnectWithFallback(target.addr, target.port, cfg);
+    const socket = await dialForTarget(target.addr, target.port, cfg);
     // 首包载荷（地址之后的部分）随后续解密流一起发出
     let pending = plain.length ? plain : null;
     const wsToSock = async (chunk) => {
@@ -3731,7 +3807,7 @@ async function handleGrpc(request, env, cfg, ctx) {
       if (done) return grpcError('空请求');
       if (acc.length > 65536) return grpcError('请求头过大');
     }
-    const socket = await dialOut(target.addr, target.port, cfg);
+    const socket = await dialForTarget(target.addr, target.port, cfg);
     const sockReader = socket.readable.getReader();
     const sockWriter = socket.writable.getWriter();
     // 上行：剩余帧载荷 + 后续帧 → socket
@@ -3823,7 +3899,7 @@ async function handleXhttp(request, env, cfg, ctx) {
       if (done) return new Response('bad request', { status: 400 });
       if (acc.length > 65536) return new Response('header too large', { status: 400 });
     }
-    const socket = await dialOut(target.addr, target.port, cfg);
+    const socket = await dialForTarget(target.addr, target.port, cfg);
     const sockReader = socket.readable.getReader();
     const sockWriter = socket.writable.getWriter();
     const upstream = (async () => {
