@@ -1813,20 +1813,237 @@ async function handleSub(env, ctx, cfg, host, format) {
 }
 
 /* ------------------------------------------------------------------
- * 出站：cloudflare:sockets TCP；失败且配了 proxyIP 则回落重试一次
+ * 出站：cloudflare:sockets TCP
+ * 拨号顺序：直连 → 链式代理（按配置）→ PROXYIP 回落。
+ * 链式代理启用且目标在白名单（白名单为空=全部）时优先走链。
  * ------------------------------------------------------------------ */
 async function tcpConnect(hostname, port) {
   const mod = await import('cloudflare:sockets');
   return mod.connect({ hostname, port });
 }
 
-async function tcpConnectWithFallback(addr, port, cfg) {
+/** 白名单判定：空=全部走链；否则目标 host 等于或以任一条目为后缀才走链 */
+export function chainAllows(cfg, targetHost) {
+  const wl = cfg.chainWhitelist || [];
+  if (!wl.length) return true;
+  const t = String(targetHost || '').toLowerCase();
+  return wl.some((w) => {
+    const s = String(w || '').toLowerCase().trim();
+    return s && (t === s || t.endsWith('.' + s));
+  });
+}
+
+/* ---------- SOCKS5（RFC 1928）握手字节构造（纯函数，可单测） ---------- */
+
+/** 握手问候：支持无认证(0x00)与账号密码(0x02) */
+export function socks5Greeting(withAuth) {
+  return withAuth
+    ? new Uint8Array([0x05, 0x02, 0x00, 0x02])
+    : new Uint8Array([0x05, 0x01, 0x00]);
+}
+
+/** 账号密码认证请求（RFC 1929） */
+export function socks5AuthRequest(user, pass) {
+  const u = te.encode(String(user || ''));
+  const p = te.encode(String(pass || ''));
+  const out = new Uint8Array(3 + u.length + p.length);
+  out[0] = 0x01;
+  out[1] = u.length; out.set(u, 2);
+  out[2 + u.length] = p.length; out.set(p, 3 + u.length);
+  return out;
+}
+
+/** CONNECT 请求：目标支持域名/IP（ATYP 按目标类型选） */
+export function socks5ConnectRequest(targetHost, targetPort) {
+  const port = [(targetPort >>> 8) & 255, targetPort & 255];
+  if (isIP(targetHost) && targetHost.includes('.')) {
+    // IPv4
+    const parts = targetHost.split('.').map(Number);
+    return new Uint8Array([0x05, 0x01, 0x00, 0x01, ...parts, ...port]);
+  }
+  if (isIP(targetHost)) {
+    // IPv6：16 字节
+    const groups = expandIPv6(targetHost);
+    const out = new Uint8Array(4 + 16 + 2);
+    out.set([0x05, 0x01, 0x00, 0x04], 0);
+    out.set(groups, 4);
+    out[out.length - 2] = port[0]; out[out.length - 1] = port[1];
+    return out;
+  }
+  // 域名
+  const h = te.encode(String(targetHost));
+  const out = new Uint8Array(4 + 1 + h.length + 2);
+  out.set([0x05, 0x01, 0x00, 0x03, h.length], 0);
+  out.set(h, 5);
+  out[out.length - 2] = port[0]; out[out.length - 1] = port[1];
+  return out;
+}
+
+/** IPv6 展开为 16 字节（处理 :: 缩写） */
+export function expandIPv6(ip) {
+  const out = new Uint8Array(16);
+  const halves = String(ip).split('::');
+  const head = halves[0] ? halves[0].split(':') : [];
+  const tail = halves[1] ? halves[1].split(':') : [];
+  const fill = 8 - head.length - tail.length;
+  const groups = [...head, ...new Array(Math.max(fill, 0)).fill('0'), ...tail].slice(0, 8);
+  groups.forEach((g, i) => {
+    const v = parseInt(g || '0', 16);
+    out[i * 2] = (v >>> 8) & 255;
+    out[i * 2 + 1] = v & 255;
+  });
+  return out;
+}
+
+/** 校验 SOCKS5 服务端应答（greeting/auth/CONNECT 均为 2 字节或 10 字节头） */
+export function socks5CheckReply(buf, expectLen) {
+  if (!buf || buf.length < expectLen) return false;
+  if (expectLen === 2) return buf[0] === 0x05 && buf[1] === 0x00;
+  return buf[0] === 0x05 && buf[1] === 0x00; // CONNECT 成功：VER=5 REP=0
+}
+
+/* ---------- HTTP(S) CONNECT 代理 ---------- */
+
+/** 构造 HTTP CONNECT 请求行（含 Proxy-Authorization） */
+export function buildHttpConnectReq(targetHost, targetPort, user, pass) {
+  let req = `CONNECT ${targetHost}:${targetPort} HTTP/1.1\r\nHost: ${targetHost}:${targetPort}\r\n`;
+  if (user) {
+    const cred = bytesToBase64(te.encode(`${user}:${pass || ''}`));
+    req += `Proxy-Authorization: Basic ${cred}\r\n`;
+  }
+  return req + '\r\n';
+}
+
+/** 读 socket 首行，判断 CONNECT 是否成功（2xx） */
+async function readHttpStatusLine(reader) {
+  let acc = new Uint8Array(0);
+  for (let i = 0; i < 8; i++) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (value) acc = concatBytes(acc, value);
+    const idx = indexOfSeq(acc, te.encode('\r\n'));
+    if (idx >= 0) {
+      const line = td.decode(acc.subarray(0, idx));
+      return { line, rest: acc.subarray(idx + 2) };
+    }
+  }
+  return { line: '', rest: acc };
+}
+
+/** 在字节流中找子序列，返回起始下标或 -1 */
+export function indexOfSeq(hay, needle) {
+  outer: for (let i = 0; i + needle.length <= hay.length; i++) {
+    for (let j = 0; j < needle.length; j++) {
+      if (hay[i + j] !== needle[j]) continue outer;
+    }
+    return i;
+  }
+  return -1;
+}
+
+/** 从 socket 读指定字节数（握手用） */
+async function readExactly(reader, n) {
+  let acc = new Uint8Array(0);
+  while (acc.length < n) {
+    const { done, value } = await reader.read();
+    if (done) throw new Error('proxy closed');
+    if (value) acc = concatBytes(acc, value);
+  }
+  return acc.subarray(0, n);
+}
+
+/** 经 SOCKS5 代理建立到目标的 TCP 隧道，返回已握手好的 socket */
+async function socks5Dial(cfg, targetHost, targetPort) {
+  const sock = await tcpConnect(cfg.chainHost, cfg.chainPort);
+  const w = sock.writable.getWriter();
+  const r = sock.readable.getReader();
+  const useAuth = !!(cfg.chainUser);
   try {
-    return await tcpConnect(addr, port);
+    await w.write(socks5Greeting(useAuth));
+    if (!socks5CheckReply(await readExactly(r, 2), 2)) throw new Error('socks5 greeting rejected');
+    if (useAuth) {
+      await w.write(socks5AuthRequest(cfg.chainUser, cfg.chainPass));
+      if (!socks5CheckReply(await readExactly(r, 2), 2)) throw new Error('socks5 auth failed');
+    }
+    await w.write(socks5ConnectRequest(targetHost, targetPort));
+    // CONNECT 应答：VER REP RSV ATYP + BND.ADDR + BND.PORT，按 ATYP 读完整
+    const head4 = await readExactly(r, 4);
+    if (head4[0] !== 0x05 || head4[1] !== 0x00) throw new Error('socks5 connect failed');
+    const atyp = head4[3];
+    if (atyp === 0x01) await readExactly(r, 6);        // IPv4: 4 + 2
+    else if (atyp === 0x04) await readExactly(r, 18);  // IPv6: 16 + 2
+    else if (atyp === 0x03) {
+      const ln = (await readExactly(r, 1))[0];
+      await readExactly(r, ln + 2);                    // 域名：1 + len + 2
+    } else throw new Error('socks5 bad atyp');
   } catch (e) {
-    if (cfg.proxyIP) return await tcpConnect(cfg.proxyIP, 443);
+    try { w.releaseLock(); } catch { /* 忽略 */ }
+    try { r.cancel(); } catch { /* 忽略 */ }
+    try { sock.close(); } catch { /* 忽略 */ }
     throw e;
   }
+  try { w.releaseLock(); } catch { /* 忽略 */ }
+  // 注意：r 仍被占用？CONNECT 成功后 reader 需交还调用方做透传。
+  // 这里把 reader 锁释放后由调用方重新 getReader。
+  try { r.releaseLock(); } catch { /* 忽略 */ }
+  return sock;
+}
+
+/** 经 HTTP/HTTPS 代理 CONNECT 到目标，返回已握手好的 socket */
+async function httpProxyDial(cfg, targetHost, targetPort) {
+  let sock = await tcpConnect(cfg.chainHost, cfg.chainPort);
+  if (cfg.chainType === 'https') {
+    // 对代理本身先做 TLS（Workers 下用 fetch 做 CONNECT 隧道较复杂，
+    // 这里用原始 TLS：暂不支持，回退为 http 语义并抛错提示）
+    try { sock.close(); } catch { /* 忽略 */ }
+    throw new Error('https 链式代理暂不支持，请用 http 或 socks5');
+  }
+  const w = sock.writable.getWriter();
+  const r = sock.readable.getReader();
+  try {
+    await w.write(te.encode(buildHttpConnectReq(targetHost, targetPort, cfg.chainUser, cfg.chainPass)));
+    const { line, rest } = await readHttpStatusLine(r);
+    if (!/^HTTP\/\d(\.\d)?\s+2\d\d/.test(line)) throw new Error('proxy connect rejected: ' + line);
+    if (rest.length) {
+      // 代理回了多余字节（不应发生），无法推回 socket，报错
+      throw new Error('proxy sent unexpected bytes');
+    }
+  } catch (e) {
+    try { w.releaseLock(); } catch { /* 忽略 */ }
+    try { r.cancel(); } catch { /* 忽略 */ }
+    try { sock.close(); } catch { /* 忽略 */ }
+    throw e;
+  }
+  try { w.releaseLock(); } catch { /* 忽略 */ }
+  try { r.releaseLock(); } catch { /* 忽略 */ }
+  return sock;
+}
+
+/** 经链式代理拨号（按 chainType 分发） */
+async function dialViaChain(addr, port, cfg) {
+  if (cfg.chainType === 'socks5') return socks5Dial(cfg, addr, port);
+  return httpProxyDial(cfg, addr, port);
+}
+
+/** 统一出站拨号：直连 → 链式代理 → PROXYIP 回落，逐个尝试 */
+async function dialOut(addr, port, cfg) {
+  const chainOk = cfg.chainEnabled && cfg.chainHost;
+  const chainFirst = chainOk && chainAllows(cfg, addr);
+  const attempts = [];
+  if (chainFirst) attempts.push(() => dialViaChain(addr, port, cfg));
+  attempts.push(() => tcpConnect(addr, port));
+  if (chainOk && !chainFirst) attempts.push(() => dialViaChain(addr, port, cfg));
+  if (cfg.proxyIP) attempts.push(() => tcpConnect(cfg.proxyIP, 443));
+  let err = null;
+  for (const fn of attempts) {
+    try { return await fn(); } catch (e) { err = e; }
+  }
+  throw err || new Error('dial failed');
+}
+
+// 旧名保留兼容（内部已统一走 dialOut）
+async function tcpConnectWithFallback(addr, port, cfg) {
+  return dialOut(addr, port, cfg);
 }
 
 /** 从 Sec-WebSocket-Protocol 头取 early data（base64） */
@@ -2057,6 +2274,213 @@ async function handleSs(server, request, env, cfg) {
     });
   } catch {
     try { ws.close(); } catch { /* 忽略 */ }
+  }
+}
+
+/* ------------------------------------------------------------------
+ * gRPC 传输（gun 模式子集，clean-room 实现）
+ * 识别：POST + Content-Type 含 application/grpc（/api/* 除外）。
+ * 帧格式参考 gRPC HTTP/2 Length-Prefixed-Message：
+ *   1B 压缩标志（0=未压缩）+ 4B 大端长度 + 载荷
+ * 首帧载荷按 VLESS 解析（失败再试 Trojan）；仅支持 TCP，UDP 拒绝。
+ * 回包逐帧封装；HTTP/1 下 trailers 无法流式发送，这里把 grpc-status
+ * 放在响应头（多数 gun 客户端可接受），已知限制见 CHANGELOG。
+ * ------------------------------------------------------------------ */
+
+/** gRPC 编码：一组载荷 → Length-Prefixed-Message 字节流 */
+export function grpcEncode(payloads) {
+  const bufs = [];
+  let total = 0;
+  for (const p of payloads) {
+    const b = p instanceof Uint8Array ? p : te.encode(String(p));
+    bufs.push(b);
+    total += 5 + b.length;
+  }
+  const out = new Uint8Array(total);
+  let o = 0;
+  for (const b of bufs) {
+    out[o++] = 0; // 压缩标志：0=未压缩
+    out[o++] = (b.length >>> 24) & 255;
+    out[o++] = (b.length >>> 16) & 255;
+    out[o++] = (b.length >>> 8) & 255;
+    out[o++] = b.length & 255;
+    out.set(b, o);
+    o += b.length;
+  }
+  return out;
+}
+
+/** gRPC 解帧：返回 {frames（完整帧载荷数组）, rest（不完整尾巴）} */
+export function grpcDecode(buf) {
+  const frames = [];
+  let o = 0;
+  while (o + 5 <= buf.length) {
+    const len = buf[o + 1] * 16777216 + (buf[o + 2] << 16) + (buf[o + 3] << 8) + buf[o + 4];
+    if (len < 0 || len > 32 * 1024 * 1024) break; // 非法长度：停
+    if (o + 5 + len > buf.length) break;          // 不完整：等更多数据
+    frames.push(buf.subarray(o + 5, o + 5 + len));
+    o += 5 + len;
+  }
+  return { frames, rest: buf.subarray(o) };
+}
+
+/** gRPC 错误响应（HTTP 200 + grpc-status 非零，客户端按 gRPC 语义处理） */
+function grpcError(message) {
+  return new Response('', {
+    headers: { 'content-type': 'application/grpc', 'grpc-status': '13', 'grpc-message': encodeURIComponent(message || 'error') },
+  });
+}
+
+/** gRPC 建连：POST body 流 → 解帧 → 协议解析 → TCP 出站 → 回包逐帧 */
+async function handleGrpc(request, env, cfg, ctx) {
+  const ok = (body) => new Response(body, {
+    headers: { 'content-type': 'application/grpc', 'grpc-status': '0', 'grpc-message': '' },
+  });
+  try {
+    const validUUIDs = [parseUUID(cfg.UUID), ...cfg.multiUUID.map(parseUUID)].filter(Boolean);
+    if (!validUUIDs.length) return grpcError('uuid 未配置');
+    const trojanHash = cfg.trojanPassword ? trojanPasswordHash(cfg.trojanPassword) : null;
+    const reader = request.body.getReader();
+    let acc = new Uint8Array(0);
+    let target = null, leftover = null;
+    // 攒出首批完整帧，做协议头解析
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (value && value.length) acc = concatBytes(acc, value);
+      const { frames, rest } = grpcDecode(acc);
+      if (frames.length) {
+        const payload = concatBytes(...frames);
+        acc = rest;
+        let hdr = null;
+        try {
+          const v = parseVlessHeader(payload, validUUIDs);
+          if (v && v.cmd === 0x01) hdr = { addr: v.addr, port: v.port, len: v.headerLen };
+        } catch { /* 不是 VLESS，试 Trojan */ }
+        if (!hdr && trojanHash) {
+          try {
+            const t = parseTrojanHeader(payload, trojanHash);
+            if (t && t.cmd === 0x01) hdr = { addr: t.addr, port: t.port, len: t.headerLen };
+          } catch { /* 不是 Trojan */ }
+        }
+        if (!hdr) return grpcError('协议头非法或仅支持 TCP');
+        target = { addr: hdr.addr, port: hdr.port };
+        leftover = payload.subarray(hdr.len);
+        break;
+      }
+      if (done) return grpcError('空请求');
+      if (acc.length > 65536) return grpcError('请求头过大');
+    }
+    const socket = await dialOut(target.addr, target.port, cfg);
+    const sockReader = socket.readable.getReader();
+    const sockWriter = socket.writable.getWriter();
+    // 上行：剩余帧载荷 + 后续帧 → socket
+    const upstream = (async () => {
+      try {
+        if (leftover && leftover.length) await sockWriter.write(leftover);
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (value && value.length) acc = concatBytes(acc, value);
+          const { frames, rest } = grpcDecode(acc);
+          acc = rest;
+          for (const f of frames) await sockWriter.write(f);
+          if (done) break;
+        }
+      } catch { /* 忽略 */ }
+      try { await sockWriter.close(); } catch { /* 忽略 */ }
+    })();
+    // 下行：socket 数据 → gRPC 帧 → 响应流
+    const downstream = new ReadableStream({
+      async start(ctrl) {
+        try {
+          for (;;) {
+            const { done, value } = await sockReader.read();
+            if (done) break;
+            if (value && value.length) ctrl.enqueue(grpcEncode([value]));
+          }
+        } catch { /* 忽略 */ }
+        try { ctrl.close(); } catch { /* 忽略 */ }
+        try { sockReader.cancel(); } catch { /* 忽略 */ }
+      },
+      cancel() { try { sockReader.cancel(); } catch { /* 忽略 */ } },
+    });
+    if (ctx) ctx.waitUntil(upstream); else upstream.catch(() => {});
+    return ok(downstream);
+  } catch {
+    return grpcError('内部错误');
+  }
+}
+
+/* ------------------------------------------------------------------
+ * XHTTP 传输（stream-one 基础模式，clean-room 实现）
+ * 识别：POST +（x-padding 请求头 或 ?xhttp= 查询参数），/api/* 除外。
+ * stream-one：整个上行流在一个 POST body 里，原始字节流（无帧封装），
+ * 首段按 VLESS/Trojan 解析目标地址，之后透传；回包原始流。
+ * （packet-up 等多请求拆分模式暂不支持，见 CHANGELOG）
+ * ------------------------------------------------------------------ */
+
+/** XHTTP 建连：body 原始流 → 协议解析 → TCP 出站 → 原始流回包 */
+async function handleXhttp(request, env, cfg, ctx) {
+  try {
+    const validUUIDs = [parseUUID(cfg.UUID), ...cfg.multiUUID.map(parseUUID)].filter(Boolean);
+    if (!validUUIDs.length) return new Response('uuid 未配置', { status: 500 });
+    const trojanHash = cfg.trojanPassword ? trojanPasswordHash(cfg.trojanPassword) : null;
+    const reader = request.body.getReader();
+    let acc = new Uint8Array(0);
+    let target = null, leftover = null;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (value && value.length) acc = concatBytes(acc, value);
+      let hdr = null;
+      try {
+        const v = parseVlessHeader(acc, validUUIDs);
+        if (v && v.cmd === 0x01) hdr = { addr: v.addr, port: v.port, len: v.headerLen };
+      } catch { /* 试 Trojan */ }
+      if (!hdr && trojanHash) {
+        try {
+          const t = parseTrojanHeader(acc, trojanHash);
+          if (t && t.cmd === 0x01) hdr = { addr: t.addr, port: t.port, len: t.headerLen };
+        } catch { /* 忽略 */ }
+      }
+      if (hdr) {
+        target = { addr: hdr.addr, port: hdr.port };
+        leftover = acc.subarray(hdr.len);
+        break;
+      }
+      if (done) return new Response('bad request', { status: 400 });
+      if (acc.length > 65536) return new Response('header too large', { status: 400 });
+    }
+    const socket = await dialOut(target.addr, target.port, cfg);
+    const sockReader = socket.readable.getReader();
+    const sockWriter = socket.writable.getWriter();
+    const upstream = (async () => {
+      try {
+        if (leftover && leftover.length) await sockWriter.write(leftover);
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          if (value && value.length) await sockWriter.write(value);
+        }
+      } catch { /* 忽略 */ }
+      try { await sockWriter.close(); } catch { /* 忽略 */ }
+    })();
+    const downstream = new ReadableStream({
+      async start(ctrl) {
+        try {
+          for (;;) {
+            const { done, value } = await sockReader.read();
+            if (done) break;
+            if (value && value.length) ctrl.enqueue(value);
+          }
+        } catch { /* 忽略 */ }
+        try { ctrl.close(); } catch { /* 忽略 */ }
+        try { sockReader.cancel(); } catch { /* 忽略 */ }
+      },
+      cancel() { try { sockReader.cancel(); } catch { /* 忽略 */ } },
+    });
+    if (ctx) ctx.waitUntil(upstream); else upstream.catch(() => {});
+    return new Response(downstream, { headers: { 'content-type': 'application/octet-stream' } });
+  } catch {
+    return new Response('internal error', { status: 500 });
   }
 }
 
