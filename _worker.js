@@ -24,7 +24,7 @@
  * 版本变更记录见仓库根目录 CHANGELOG.md。
  */
 
-export const SS_VERSION = '3.1.0';
+export const SS_VERSION = '3.2.0';
 
 /* ------------------------------------------------------------------
  * 国家代码 → 中文国名映射表（ISO 3166-1 alpha-2）
@@ -1163,14 +1163,14 @@ export async function refreshGeoCache(ips, env) {
 
 /* ------------------------------------------------------------------
  * 订阅节点组装
- * 命名：{国旗emoji}{中文国名} {组内序号}，如 🇺🇸 美国 01；
- * 条目带 #备注 时追加在末尾，如 🇺🇸 美国 01 香港专线。
+ * 命名：{域名} {国旗emoji}{中文国名} {组内序号}，如 udptoos.com 🇺🇸 美国 01；
+ * 条目带 #备注 时追加在末尾，如 example.com 🇺🇸 美国 01 香港专线。
  * 排序：按国家代码分组（未知归属地 '??' 排最后），组内按 IP 排序；
- * 每个国家组内独立编号 01..NN（不同国家序号不混排）。
+ * 每个国家组内独立编号 01..NN（不同国家序号不混排），同国家节点排在一起。
  * 每个 IP 生成 VLESS / Trojan / SS 各一条（按配置启用的协议）
  * 输入兼容旧格式的字符串数组（自动转为条目）。
  * ------------------------------------------------------------------ */
-export function buildNodeNames(entries, geoMap) {
+export function buildNodeNames(entries, geoMap, hostPrefix) {
   const items = (entries || []).map((e) => {
     const en = typeof e === 'string' ? { ip: e, port: 0, remark: '' } : e;
     return { ip: en.ip, port: en.port || 0, remark: en.remark || '', code: (geoMap || {})[en.ip] || '??' };
@@ -1184,13 +1184,14 @@ export function buildNodeNames(entries, geoMap) {
   });
   // 每组独立编号：🇺🇸 美国 01、🇺🇸 美国 02、🇨🇦 加拿大 01……
   const counters = Object.create(null);
+  const prefix = hostPrefix ? hostPrefix + ' ' : '';
   return items.map((it) => {
     const known = it.code !== '??';
     const flag = known ? countryFlag(it.code) : '🌐';
     const name = known ? countryNameOf(it.code) : '未知';
     const n = (counters[it.code] = (counters[it.code] || 0) + 1);
     const num = String(n).padStart(2, '0');
-    const full = `${flag} ${name} ${num}` + (it.remark ? ` ${it.remark}` : '');
+    const full = `${prefix}${flag} ${name} ${num}` + (it.remark ? ` ${it.remark}` : '');
     return { ip: it.ip, port: it.port, code: it.code, name: full };
   });
 }
@@ -2971,7 +2972,7 @@ async function handleSub(request, env, ctx, cfg, host, explicitFormat) {
   await Promise.all(entries.map(async (e) => { geoMap[e.ip] = await getCachedGeo(e.ip, env); }));
   // 后台补齐缺失的归属地，不阻塞本次响应
   ctx.waitUntil(refreshGeoCache(entries.map((e) => e.ip), env));
-  const nodes = buildNodeNames(entries, geoMap);
+  const nodes = buildNodeNames(entries, geoMap, host);
   // ?sub= 聚合外部订阅
   const aggParam = url.searchParams.get('sub');
   let aggLinks = [];

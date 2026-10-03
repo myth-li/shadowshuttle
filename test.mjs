@@ -165,17 +165,23 @@ eq('name HK', countryNameOf('HK'), '香港');
 eq('name TW', countryNameOf('TW'), '台湾');
 eq('name 未知', countryNameOf('ZZ'), '未知');
 
-console.log('[8] 节点命名：按国家分组 + 组内独立编号');
+console.log('[8] 节点命名：域名前缀 + 按国家分组 + 组内独立编号');
 {
   const ips = ['1.1.1.1', '2.2.2.2', '3.3.3.3', '4.4.4.4'];
   const geo = { '1.1.1.1': 'US', '2.2.2.2': 'HK', '3.3.3.3': null, '4.4.4.4': 'US' };
-  const nodes = buildNodeNames(ips, geo);
-  eq('节点名', nodes.map((n) => n.name), ['🇭🇰 香港 01', '🇺🇸 美国 01', '🇺🇸 美国 02', '🌐 未知 01']);
+  const nodes = buildNodeNames(ips, geo, 'udptoos.com');
+  eq('节点名', nodes.map((n) => n.name),
+    ['udptoos.com 🇭🇰 香港 01', 'udptoos.com 🇺🇸 美国 01', 'udptoos.com 🇺🇸 美国 02', 'udptoos.com 🌐 未知 01']);
+  // 同国家必须排在一起（国家分组内连续）
+  const codes = nodes.map((n) => n.code);
+  eq('分组连续', codes, ['HK', 'US', 'US', '??']);
 }
 {
-  // 备注追加在组内编号之后
+  // 无前缀时保持原格式；备注追加在组内编号之后
   const nodes = buildNodeNames([{ ip: '5.5.5.5', port: 0, remark: '专线' }], { '5.5.5.5': 'JP' });
-  eq('备注', nodes[0].name, '🇯🇵 日本 01 专线');
+  eq('无前缀', nodes[0].name, '🇯🇵 日本 01 专线');
+  const nodes2 = buildNodeNames([{ ip: '5.5.5.5', port: 0, remark: '专线' }], { '5.5.5.5': 'JP' }, 'example.com');
+  eq('备注', nodes2[0].name, 'example.com 🇯🇵 日本 01 专线');
 }
 
 console.log('[9] 订阅拼装');
