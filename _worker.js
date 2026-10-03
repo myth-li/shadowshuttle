@@ -24,7 +24,7 @@
  * 版本变更记录见仓库根目录 CHANGELOG.md。
  */
 
-export const SS_VERSION = '3.4.0';
+export const SS_VERSION = '3.5.0';
 
 /* ------------------------------------------------------------------
  * 国家代码 → 中文国名映射表（ISO 3166-1 alpha-2）
@@ -2461,6 +2461,42 @@ function adminApp(SUB_INIT) {
     next();
   };
 
+  /* ---------- 测速结果导入：CloudflareSpeedTest → 静态优选 IP ---------- */
+  $('speedImportBtn').onclick = function () {
+    var raw = ($('f-speedtestRaw').value || '').trim();
+    var topN = Math.max(1, Math.min(500, parseInt($('f-speedtestTopN').value, 10) || 99));
+    var box = $('speedImportRes');
+    if (!raw) { box.innerHTML = '<div class="hint">请先粘贴测速结果</div>'; return; }
+    // 逐行提取 IP；若行内含延迟列（IP,端口,延迟ms）则按延迟排序
+    var seen = {}, rows = [];
+    raw.split('\n').forEach(function (line) {
+      var m = line.match(/\b(?:\d{1,3}\.){3}\d{1,3}\b/);
+      if (!m) return;
+      var ip = m[0];
+      if (!ip.split('.').every(function (p) { return +p <= 255; })) return;
+      if (seen[ip]) return;
+      seen[ip] = 1;
+      var latency = null;
+      var cols = line.split(',');
+      if (cols.length >= 3) {
+        var l = parseFloat(cols[2]);
+        if (isFinite(l) && l >= 0 && l < 100000) latency = l;
+      }
+      rows.push({ ip: ip, latency: latency });
+    });
+    if (!rows.length) { box.innerHTML = '<div class="hint">没提取到有效 IP，请检查粘贴的内容</div>'; return; }
+    var withLat = rows.filter(function (r) { return r.latency !== null; });
+    var sorted = withLat.length ? rows.slice().sort(function (a, b) {
+      var la = a.latency === null ? 1e9 : a.latency, lb = b.latency === null ? 1e9 : b.latency;
+      return la - lb;
+    }) : rows;
+    var picked = sorted.slice(0, topN).map(function (r) { return r.ip; });
+    $('f-preferredStatic').value = picked.join('\n');
+    markDirty();
+    box.innerHTML = '<div class="trow"><span class="ok">已填入 ' + picked.length + ' 个最快 IP 到静态优选</span>' +
+      '<span class="hint">记得点底部保存</span></div>';
+  };
+
   /* ---------- 链式代理检查 ---------- */
   $('chainTestBtn').onclick = function () {
     var box = $('chainTestRes');
@@ -2625,6 +2661,13 @@ export function adminPageHTML(subPath) {
     srow('🎲', '随机数量', fNum('randIPCount', '16'), '订阅节点总数目标：静态 IP 与来源 IP 优先保留，不足部分随机补足。设 0 关闭随机补足') +
     srow('🔌', '随机端口', fNum('randIPPort', '443')) +
     srow('🛰️', 'IPinfo Token', fText('ipinfoToken', 'ipinfo.io 的 token'), '填了就用 IPinfo 查归属地（更稳、更快）；不填用免费 ip-api') +
+    '<div style="margin:14px 0 6px;padding-top:10px;border-top:1px solid #e5e7eb">' +
+      '<b>⚡ 测速结果导入</b>' +
+      '<div class="hint">CloudflareSpeedTest 在电脑上跑完，把 result.csv（或输出文本）粘贴进来，自动取最快的 N 个填入静态优选。说明：IP 快不快取决于你手机当地网络，服务器端测不出来，本地测速是标准做法。</div></div>' +
+    srow('📋', '测速结果', '<textarea class="inp" id="f-speedtestRaw" rows="4" placeholder="粘贴 result.csv 或输出文本，自动提取 IP" autocomplete="off" spellcheck="false"></textarea>') +
+    srow('🔝', '取前 N 个', '<input class="inp" id="f-speedtestTopN" type="number" min="1" max="500" value="99">', '取最快的前 N 个 IP，替换现有静态优选 IP') +
+    '<div style="margin:10px 0 4px"><button class="btn btn-ghost btn-sm" id="speedImportBtn">⚡ 导入为静态优选 IP</button></div>' +
+    '<div id="speedImportRes"></div>' +
     '<div style="margin:10px 0 4px"><button class="btn btn-ghost btn-sm" id="srcTestBtn">🔍 验证优选源</button></div>' +
     '<div id="srcTestRes"></div>',
     true) +
