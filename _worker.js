@@ -24,7 +24,7 @@
  * 版本变更记录见仓库根目录 CHANGELOG.md。
  */
 
-export const SS_VERSION = '3.2.0';
+export const SS_VERSION = '3.3.0';
 
 /* ------------------------------------------------------------------
  * 国家代码 → 中文国名映射表（ISO 3166-1 alpha-2）
@@ -1029,6 +1029,30 @@ async function getCloudflareCIDRs(env) {
   return cidrs;
 }
 
+/** 按日期播种的确定性随机数（mulberry32 + FNV-1a 种子）：
+ *  同一天内生成的随机 IP 列表完全稳定（订阅刷新不闪变，归属地缓存一次补齐
+ *  全天有效），跨天自动轮换一批新 IP。 */
+export function seededRand(str) {
+  let h = 2166136261 >>> 0;
+  for (let i = 0; i < str.length; i++) {
+    h ^= str.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  let a = h >>> 0;
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+/** 当天日期种子（UTC），如 2026-10-3 */
+export function todaySeed() {
+  const d = new Date();
+  return `${d.getUTCFullYear()}-${d.getUTCMonth() + 1}-${d.getUTCDate()}`;
+}
+
 /** 内置随机优选 IP 生成器：从 CF 段随机抽 count 个 */
 export async function genRandomPreferredIPs(count, env, rand) {
   if (!count || count <= 0) return [];
@@ -1058,11 +1082,11 @@ export async function getPreferredIPs(cfg, env) {
   const kv = env.KV;
   const results = await Promise.all((cfg.preferredSources || []).map((u) => fetchSourceIPs(u, kv)));
   for (const ips of results) for (const ip of ips) push(ip, 0, '');
-  // 4. 随机生成：补足到总数目标
+  // 4. 随机生成：补足到总数目标（按日期播种，同一天结果稳定）
   if (cfg.randIPCount > 0) {
     const need = Math.max(0, cfg.randIPCount - out.length);
     if (need > 0) {
-      const rnd = await genRandomPreferredIPs(need, env);
+      const rnd = await genRandomPreferredIPs(need, env, seededRand('ss-rand-' + todaySeed()));
       for (const ip of rnd) push(ip, cfg.randIPPort || 0, '');
     }
   }

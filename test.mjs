@@ -10,7 +10,7 @@ import {
   ssSubkey, SS_METHODS, SsDecryptor, SsEncryptor,
   parseVlessHeader, parseTrojanHeader, parseUUID, bytesEqual,
   countryFlag, countryNameOf, buildNodeNames, queryGeoBatch, refreshGeoCache,
-  getPreferredIPs,
+  getPreferredIPs, genRandomPreferredIPs, seededRand, todaySeed,
   buildVlessUri, buildTrojanUri, buildSsUri, buildBase64Sub, buildClashSub, buildSingboxSub,
   buildSurgeSub, buildQuanxSub, buildLoonSub,
   linesToList, isIP, base64ToBytes, bytesToBase64,
@@ -502,6 +502,31 @@ console.log('[25] 优选 IP 数量语义：总数目标，随机补足差额');
     const cfg3 = { preferredStatic: ['1.1.1.1'], preferredSources: [], randIPCount: 0, randIPPort: 0 };
     const entries3 = await getPreferredIPs(cfg3, { KV: fakeKV });
     eq('0=关闭随机', entries3.length, 1);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+}
+
+console.log('[26] 随机 IP 按日期播种：同一天稳定，换种变化');
+{
+  const realFetch = globalThis.fetch;
+  const fakeKV = { get: async () => null, put: async () => {} };
+  globalThis.fetch = async (url) => {
+    if (String(url).includes('cloudflare.com/ips-v4')) {
+      return { ok: true, text: async () => '10.0.0.0/24\n11.0.0.0/24\n' };
+    }
+    throw new Error('unexpected fetch ' + url);
+  };
+  try {
+    const a = await genRandomPreferredIPs(20, { KV: fakeKV }, seededRand('ss-rand-2026-10-3'));
+    const b = await genRandomPreferredIPs(20, { KV: fakeKV }, seededRand('ss-rand-2026-10-3'));
+    eq('同种同结果', a, b);
+    const c = await genRandomPreferredIPs(20, { KV: fakeKV }, seededRand('ss-rand-2026-10-4'));
+    ok('换种不同结果', JSON.stringify(a) !== JSON.stringify(c));
+    ok('todaySeed 格式', /^\d{4}-\d{1,2}-\d{1,2}$/.test(todaySeed()));
+    // seededRand 输出范围
+    const r = seededRand('x');
+    ok('随机数范围', r() >= 0 && r() < 1);
   } finally {
     globalThis.fetch = realFetch;
   }
