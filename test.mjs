@@ -9,7 +9,7 @@ import {
   chacha20Poly1305Encrypt, chacha20Poly1305Decrypt,
   ssSubkey, SS_METHODS, SsDecryptor, SsEncryptor,
   parseVlessHeader, parseTrojanHeader, parseUUID, bytesEqual,
-  countryFlag, countryNameOf, buildNodeNames, queryGeoBatch, refreshGeoCache,
+  countryFlag, countryNameOf, buildNodeNames, queryGeoBatch, queryGeoIpinfo, refreshGeoCache,
   getPreferredIPs, genRandomPreferredIPs, seededRand, todaySeed,
   buildVlessUri, buildTrojanUri, buildSsUri, buildBase64Sub, buildClashSub, buildSingboxSub,
   buildSurgeSub, buildQuanxSub, buildLoonSub,
@@ -467,7 +467,7 @@ console.log('[24] 批量归属地查询 / 缓存补齐（stub fetch + 假 KV）'
   try {
     const got = await queryGeoBatch(['1.1.1.1', '10.0.0.1']);
     eq('batch 解析', got, { '1.1.1.1': 'US' });
-    await refreshGeoCache(['9.9.9.9', '1.1.1.1', '10.0.0.1'], { KV: fakeKV });
+    await refreshGeoCache(['9.9.9.9', '1.1.1.1', '10.0.0.1'], { KV: fakeKV }, {});
     eq('缓存命中不重查', store.get('ss:geo:9.9.9.9'), 'DE');
     eq('成功写入', store.get('ss:geo:1.1.1.1'), 'US');
     eq('失败记 ??', store.get('ss:geo:10.0.0.1'), '??');
@@ -527,6 +527,36 @@ console.log('[26] 随机 IP 按日期播种：同一天稳定，换种变化');
     // seededRand 输出范围
     const r = seededRand('x');
     ok('随机数范围', r() >= 0 && r() < 1);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+}
+
+console.log('[27] IPinfo 归属地查询（stub fetch）');
+{
+  const realFetch = globalThis.fetch;
+  const puts = [];
+  const store = new Map();
+  const fakeKV = {
+    get: async (k) => (store.has(k) ? store.get(k) : null),
+    put: async (k, v, opt) => { puts.push([k, v, opt]); store.set(k, v); },
+  };
+  globalThis.fetch = async (url) => {
+    const u = String(url);
+    if (u.startsWith('https://ipinfo.io/')) {
+      const ip = u.split('/')[3].split('?')[0];
+      if (!u.includes('token=TESTTOKEN')) throw new Error('token 未传递');
+      return { ok: true, json: async () => ({ ip, country: ip === '1.1.1.1' ? 'us' : null }) };
+    }
+    throw new Error('unexpected fetch ' + url);
+  };
+  try {
+    const got = await queryGeoIpinfo(['1.1.1.1', '2.2.2.2'], 'TESTTOKEN');
+    eq('ipinfo 解析', got, { '1.1.1.1': 'US' });
+    eq('无 token 返回空', await queryGeoIpinfo(['1.1.1.1'], ''), {});
+    await refreshGeoCache(['1.1.1.1', '2.2.2.2'], { KV: fakeKV }, { ipinfoToken: 'TESTTOKEN' });
+    eq('ipinfo 成功写入', store.get('ss:geo:1.1.1.1'), 'US');
+    eq('ipinfo 失败记 ??', store.get('ss:geo:2.2.2.2'), '??');
   } finally {
     globalThis.fetch = realFetch;
   }

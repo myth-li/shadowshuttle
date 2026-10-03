@@ -24,7 +24,7 @@
  * 版本变更记录见仓库根目录 CHANGELOG.md。
  */
 
-export const SS_VERSION = '3.3.0';
+export const SS_VERSION = '3.4.0';
 
 /* ------------------------------------------------------------------
  * 国家代码 → 中文国名映射表（ISO 3166-1 alpha-2）
@@ -746,6 +746,7 @@ const DEFAULT_CONFIG = {
   preferredStatic: [],      // 静态优选 IP 列表（支持 IP / IP:端口 / IP#备注）
   randIPCount: 16,          // 订阅节点总数目标（静态+来源优先，随机补足差额；0=关闭随机）
   randIPPort: 443,          // 随机优选 IP 端口
+  ipinfoToken: '',          // IPinfo Token（空=用免费 ip-api 查归属地；填了走 IPinfo，更稳）
   // —— 出站 ——
   proxyIP: '',              // 回落 IP（出站失败时重试）
   speedtestDomains: ['speedtest.net', 'speed.cloudflare.com', 'fast.com'],
@@ -817,6 +818,7 @@ export async function loadConfig(env) {
   cfg.nodePort = clampPort(cfg.nodePort, 443);
   cfg.randIPPort = clampPort(cfg.randIPPort, 443);
   cfg.randIPCount = clampInt(cfg.randIPCount, 0, 500, 16);
+  cfg.ipinfoToken = String(cfg.ipinfoToken || '').trim();
   cfg.ssAltPort = clampInt(cfg.ssAltPort, 0, 65535, 0);
   cfg.chainPort = clampPort(cfg.chainPort, 1080);
   cfg.dialConcurrency = clampInt(cfg.dialConcurrency, 2, 5, 3);
@@ -863,6 +865,7 @@ export async function saveConfig(env, input) {
   keepIfEmpty('chainPass');
   keepIfEmpty('tgBotToken');
   keepIfEmpty('cfApiToken');
+  keepIfEmpty('ipinfoToken');
   const cfg = { ...DEFAULT_CONFIG };
   cfg.multiUUID = linesToList(input.multiUUID).filter((s) => parseUUID(s));
   cfg.trojanPassword = String(input.trojanPassword || '').trim();
@@ -879,6 +882,7 @@ export async function saveConfig(env, input) {
   cfg.preferredStatic = linesToList(input.preferredStatic);
   cfg.randIPCount = clampInt(input.randIPCount, 0, 500, 16);
   cfg.randIPPort = clampPort(input.randIPPort, 443);
+  cfg.ipinfoToken = String(input.ipinfoToken || '').trim();
   cfg.proxyIP = isIP(String(input.proxyIP || '').trim()) ? String(input.proxyIP).trim() : '';
   cfg.speedtestDomains = linesToList(input.speedtestDomains);
   cfg.chainEnabled = !!input.chainEnabled;
@@ -1094,12 +1098,12 @@ export async function getPreferredIPs(cfg, env) {
 }
 
 /* ------------------------------------------------------------------
- * IP 归属地：ip-api.com（免费，无需 key），KV 缓存。
- * 订阅生成时只读缓存；缺失的在后台（waitUntil）用 /batch 接口一次性
- * 补齐（单次最多 100 个 IP），缺失时节点先显示 🌐 未知，不阻塞订阅。
- * 成功结果缓存 30 天；查询失败只缓存 1 小时，避免长期污染。
- * 之前串行 1.4s/IP 的写法在 IP 多时 waitUntil 跑不完，缓存永远补不齐，
- * 这就是订阅里长期显示"未知"的根因。
+ * IP 归属地：优先 IPinfo（用户自备 token，更稳），否则 ip-api.com（免费）。
+ * 订阅生成时只读缓存；缺失的在后台（waitUntil）补齐：IPinfo 逐个查（20 并发）、
+ * ip-api 用 /batch 接口一次性补齐（单次最多 100 个 IP）；缺失时节点先显示
+ * 🌐 未知，不阻塞订阅。成功结果缓存 30 天；查询失败只缓存 1 小时，避免长期污染。
+ * 注意：随机 IP 按日期播种、每天只换一批，否则 IP 每次拉取都重抽、缓存永远追不上，
+ * 这是之前订阅长期显示"未知"的根因（v3.3 已修）。
  * ------------------------------------------------------------------ */
 async function queryGeo(ip) {
   try {
@@ -1141,6 +1145,32 @@ export async function queryGeoBatch(ips) {
   return out;
 }
 
+/** IPinfo 归属地查询（用户自备 token，更稳）。
+ *  IPinfo 没有 batch 接口，逐个查、每批 20 并发；返回 {ip: 国家代码}。
+ *  免费 token 每月 5 万次，96 IP/天 ≈ 2880/月，够用。 */
+export async function queryGeoIpinfo(ips, token) {
+  const out = {};
+  if (!ips || !ips.length || !token) return out;
+  for (let i = 0; i < ips.length; i += 20) {
+    const chunk = ips.slice(i, i + 20);
+    const results = await Promise.all(chunk.map(async (ip) => {
+      try {
+        const ctrl = new AbortController();
+        const timer = setTimeout(() => ctrl.abort(), 10000);
+        const res = await fetch(`https://ipinfo.io/${encodeURIComponent(ip)}?token=${encodeURIComponent(token)}`,
+          { signal: ctrl.signal });
+        clearTimeout(timer);
+        if (!res.ok) return null;
+        const j = await res.json();
+        if (j && j.country) return [String(ip), String(j.country).toUpperCase()];
+      } catch { /* 忽略 */ }
+      return null;
+    }));
+    for (const r of results) if (r) out[r[0]] = r[1];
+  }
+  return out;
+}
+
 /** 读缓存的归属地；miss 返回 null（调用方负责后台补齐） */
 export async function getCachedGeo(ip, env) {
   const kv = env.KV;
@@ -1151,8 +1181,10 @@ export async function getCachedGeo(ip, env) {
   } catch { return null; }
 }
 
-/** 后台补齐缺失的归属地缓存（传给 ctx.waitUntil） */
-export async function refreshGeoCache(ips, env) {
+/** 后台补齐缺失的归属地缓存（传给 ctx.waitUntil）
+ *  有 IPinfo Token 时走 IPinfo（逐个查、20 并发）；否则走 ip-api /batch，
+ *  全部失败才回退串行单个查询。 */
+export async function refreshGeoCache(ips, env, cfg) {
   const kv = env.KV;
   if (!kv) return;
   const uniq = [...new Set(ips || [])].filter(Boolean);
@@ -1163,25 +1195,33 @@ export async function refreshGeoCache(ips, env) {
   }));
   const missing = uniq.filter((_, i) => !flags[i]);
   if (!missing.length) return;
-  // 批量查询（每批 100），全部失败才回退串行单个查询
-  for (let i = 0; i < missing.length; i += 100) {
-    const batch = missing.slice(i, i + 100);
-    let got = await queryGeoBatch(batch);
-    if (!Object.keys(got).length && batch.length) {
-      got = {};
-      for (const ip of batch) {
-        const code = await queryGeo(ip);
-        if (code) got[ip] = code;
-        await new Promise((r) => setTimeout(r, 1400));
+  const token = (cfg && cfg.ipinfoToken) || '';
+  let gotAll = {};
+  if (token) {
+    // IPinfo：逐个查、20 并发
+    gotAll = await queryGeoIpinfo(missing, token);
+  } else {
+    // ip-api：批量查询（每批 100），全部失败才回退串行单个查询
+    for (let i = 0; i < missing.length; i += 100) {
+      const batch = missing.slice(i, i + 100);
+      let got = await queryGeoBatch(batch);
+      if (!Object.keys(got).length && batch.length) {
+        got = {};
+        for (const ip of batch) {
+          const code = await queryGeo(ip);
+          if (code) got[ip] = code;
+          await new Promise((r) => setTimeout(r, 1400));
+        }
       }
+      Object.assign(gotAll, got);
     }
-    for (const ip of batch) {
-      const code = got[ip] || null;
-      try {
-        await kv.put(KV_GEO_PREFIX + ip, code || '??',
-          { expirationTtl: code ? 30 * 86400 : 3600 });
-      } catch { /* 忽略 */ }
-    }
+  }
+  for (const ip of missing) {
+    const code = gotAll[ip] || null;
+    try {
+      await kv.put(KV_GEO_PREFIX + ip, code || '??',
+        { expirationTtl: code ? 30 * 86400 : 3600 });
+    } catch { /* 忽略 */ }
   }
 }
 
@@ -2216,6 +2256,7 @@ function adminApp(SUB_INIT) {
   var FIELDS = [
     ['multiUUID', 'ta'], ['trojanPassword', 't'], ['ssPassword', 't'], ['ssMethod', 'sel'], ['ssAltPort', 'n'],
     ['preferredSources', 'ta'], ['preferredStatic', 'ta'], ['randIPCount', 'n'], ['randIPPort', 'n'],
+    ['ipinfoToken', 't'],
     ['proxyIP', 't'], ['speedtestDomains', 'ta'], ['chainEnabled', 'b'], ['chainType', 'pill'], ['chainHost', 't'], ['chainPort', 'n'],
     ['chainUser', 't'], ['chainPass', 't'], ['chainWhitelist', 'ta'],
     ['dialRace', 'b'], ['dialConcurrency', 'n'], ['dialTimeoutMs', 'n'],
@@ -2225,7 +2266,7 @@ function adminApp(SUB_INIT) {
     ['cfApiToken', 't'], ['cfAccountId', 't']
   ];
   // 后端不回显的密码类字段：空值表示"不修改"，仅做占位提示
-  var NOECHO = { ssPassword: 1, chainPass: 1, tgBotToken: 1, cfApiToken: 1 };
+  var NOECHO = { ssPassword: 1, chainPass: 1, tgBotToken: 1, cfApiToken: 1, ipinfoToken: 1 };
   function fieldEl(k) { return $('f-' + k); }
   function getVal(k, type) {
     var el = fieldEl(k);
@@ -2583,6 +2624,7 @@ export function adminPageHTML(subPath) {
       '手动指定的固定 IP，优先级最高') +
     srow('🎲', '随机数量', fNum('randIPCount', '16'), '订阅节点总数目标：静态 IP 与来源 IP 优先保留，不足部分随机补足。设 0 关闭随机补足') +
     srow('🔌', '随机端口', fNum('randIPPort', '443')) +
+    srow('🛰️', 'IPinfo Token', fText('ipinfoToken', 'ipinfo.io 的 token'), '填了就用 IPinfo 查归属地（更稳、更快）；不填用免费 ip-api') +
     '<div style="margin:10px 0 4px"><button class="btn btn-ghost btn-sm" id="srcTestBtn">🔍 验证优选源</button></div>' +
     '<div id="srcTestRes"></div>',
     true) +
@@ -2758,6 +2800,7 @@ function handleGetConfig(cfg, env) {
     preferredStatic: cfg.preferredStatic,
     randIPCount: cfg.randIPCount,
     randIPPort: cfg.randIPPort,
+    ipinfoToken: '', // Token 不回显
     proxyIP: cfg.proxyIP,
     speedtestDomains: cfg.speedtestDomains,
     chainEnabled: cfg.chainEnabled,
@@ -2793,7 +2836,7 @@ async function handlePostConfig(request, env, ctx) {
       ctx.waitUntil((async () => {
         try {
           const entries = await getPreferredIPs(cfg, env);
-          await refreshGeoCache(entries.map((e) => e.ip), env);
+          await refreshGeoCache(entries.map((e) => e.ip), env, cfg);
         } catch { /* 忽略 */ }
       })());
     }
@@ -2995,7 +3038,7 @@ async function handleSub(request, env, ctx, cfg, host, explicitFormat) {
   const geoMap = {};
   await Promise.all(entries.map(async (e) => { geoMap[e.ip] = await getCachedGeo(e.ip, env); }));
   // 后台补齐缺失的归属地，不阻塞本次响应
-  ctx.waitUntil(refreshGeoCache(entries.map((e) => e.ip), env));
+  ctx.waitUntil(refreshGeoCache(entries.map((e) => e.ip), env, cfg));
   const nodes = buildNodeNames(entries, geoMap, host);
   // ?sub= 聚合外部订阅
   const aggParam = url.searchParams.get('sub');
