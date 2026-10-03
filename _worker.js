@@ -3447,7 +3447,7 @@ async function handleSub(request, env, ctx, cfg, host, explicitFormat) {
   const url = new URL(request.url);
   // 家庭 IP 订阅：每个网关一个节点，服务器为 Worker 自身域名，路径带网关序号
   if (isRes) {
-    const resFormat = String(explicitFormat).slice(4) || detectSubFormat(request, null);
+    const resFormat = String(explicitFormat).replace(/^res-?/, '') || detectSubFormat(request, null);
     const nodes = cfg.resGateways.map((gw, i) => ({
       ip: host, port: 443, gwIdx: i,
       name: `${cfg.resName || '家宽'}-${gw.name}`,
