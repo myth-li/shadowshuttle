@@ -3413,6 +3413,7 @@ async function handleCheckRes(env, cfg) {
   }
   const results = [];
   for (const gw of cfg.resGateways) {
+    const t0 = Date.now();
     try {
       const c2 = { ...cfg, chainType: 'socks5', chainHost: gw.host, chainPort: gw.port, chainUser: gw.user, chainPass: gw.pass };
       const sock = await socks5Dial(c2, 'api.ipify.org', 80);
@@ -3420,9 +3421,9 @@ async function handleCheckRes(env, cfg) {
       const ip = body.split('\n')[0].trim();
       if (!isIP(ip)) throw new Error('出口 IP 解析失败');
       const geo = await getCachedGeo(ip, env).catch(() => null);
-      results.push({ name: gw.name, ok: true, ip, country: geo ? countryNameOf(geo) : '' });
+      results.push({ name: gw.name, ok: true, ip, country: geo ? countryNameOf(geo) : '', ms: Date.now() - t0 });
     } catch (e) {
-      results.push({ name: gw.name, ok: false, error: String(e && e.message || e).slice(0, 80) });
+      results.push({ name: gw.name, ok: false, error: String(e && e.message || e).slice(0, 80), ms: Date.now() - t0 });
     }
   }
   return json({ ok: true, results });
