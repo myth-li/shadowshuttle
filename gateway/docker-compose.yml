@@ -1,7 +1,7 @@
 services:
-  gateway:
+  gateway-jp:
     build: .
-    container_name: res-gateway
+    container_name: res-gateway-jp
     cap_add:
       - NET_ADMIN
     devices:
@@ -12,7 +12,51 @@ services:
       - SOCKS_USER=${SOCKS_USER:-resuser}
       - SOCKS_PASS=${SOCKS_PASS:?请在 .env 里设置 SOCKS_PASS}
       - SOCKS_PORT=1080
-      - COUNTRY=${COUNTRY:-JP,KR,US}
+      - COUNTRY=JP
+      - CHECK_INTERVAL=${CHECK_INTERVAL:-60}
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  gateway-kr:
+    build: .
+    container_name: res-gateway-kr
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun
+    ports:
+      - "1081:1080"
+    environment:
+      - SOCKS_USER=${SOCKS_USER:-resuser}
+      - SOCKS_PASS=${SOCKS_PASS:?请在 .env 里设置 SOCKS_PASS}
+      - SOCKS_PORT=1080
+      - COUNTRY=KR
+      - CHECK_INTERVAL=${CHECK_INTERVAL:-60}
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  gateway-us:
+    build: .
+    container_name: res-gateway-us
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun
+    ports:
+      - "1082:1080"
+    environment:
+      - SOCKS_USER=${SOCKS_USER:-resuser}
+      - SOCKS_PASS=${SOCKS_PASS:?请在 .env 里设置 SOCKS_PASS}
+      - SOCKS_PORT=1080
+      - COUNTRY=US
       - CHECK_INTERVAL=${CHECK_INTERVAL:-60}
     restart: unless-stopped
     logging:
