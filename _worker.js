@@ -3671,7 +3671,8 @@ export function expandIPv6(ip) {
 /** 校验 SOCKS5 服务端应答（greeting/auth/CONNECT 均为 2 字节或 10 字节头） */
 export function socks5CheckReply(buf, expectLen) {
   if (!buf || buf.length < expectLen) return false;
-  if (expectLen === 2) return buf[0] === 0x05 && buf[1] === 0x00;
+  // greeting 应答：第 2 字节是选定的认证方式，0x00=无需认证，0x02=账号密码认证，都算握手成功
+  if (expectLen === 2) return buf[0] === 0x05 && (buf[1] === 0x00 || buf[1] === 0x02);
   return buf[0] === 0x05 && buf[1] === 0x00; // CONNECT 成功：VER=5 REP=0
 }
 
@@ -3733,8 +3734,10 @@ async function socks5Dial(cfg, targetHost, targetPort) {
   const useAuth = !!(cfg.chainUser);
   try {
     await w.write(socks5Greeting(useAuth));
-    if (!socks5CheckReply(await readExactly(r, 2), 2)) throw new Error('socks5 greeting rejected');
-    if (useAuth) {
+    const greetReply = await readExactly(r, 2);
+    if (!socks5CheckReply(greetReply, 2)) throw new Error('socks5 greeting rejected');
+    // 以服务端实际选定的认证方式为准（0x02=账号密码认证）
+    if (greetReply[1] === 0x02) {
       await w.write(socks5AuthRequest(cfg.chainUser, cfg.chainPass));
       if (!socks5CheckReply(await readExactly(r, 2), 2)) throw new Error('socks5 auth failed');
     }
