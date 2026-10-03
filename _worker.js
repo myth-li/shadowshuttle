@@ -788,10 +788,12 @@ export function linesToList(s) {
  * 支持两种格式（每行一个）：
  *   备注#host:port:user:pass       （如：日本#35.212.128.72:1080:resuser:xxx）
  *   socks5://user:pass@host:port#备注
+ * 行首加 # 表示临时禁用该网关（如：#日本#host:port:user:pass）。
  * 返回 [{name, host, port, user, pass}]，非法行跳过。 */
 export function parseResGateways(input) {
   const out = [];
   for (const line of linesToList(input)) {
+    if (line.startsWith('#') && !/^socks5:\/\//i.test(line)) continue; // # 开头=禁用
     let name = '', host = '', port = 1080, user = '', pass = '';
     if (/^socks5:\/\//i.test(line)) {
       try {
@@ -2749,9 +2751,10 @@ function adminApp(SUB_INIT) {
       if (j && j.ok && j.results) {
         var html = '';
         j.results.forEach(function (r) {
+          var ms = (r.ms != null) ? ' <span class="muted">' + r.ms + 'ms</span>' : '';
           html += '<div class="trow">' +
-            (r.ok ? '<span class="ok">' + esc(r.name) + '：出口 ' + esc(r.ip) + '（' + esc(r.country || '未知地区') + '）</span>'
-                  : '<span class="bad">' + esc(r.name) + '：' + esc(r.error || '连接失败') + '</span>') +
+            (r.ok ? '<span class="ok">' + esc(r.name) + '：出口 ' + esc(r.ip) + '（' + esc(r.country || '未知地区') + '）</span>' + ms
+                  : '<span class="bad">' + esc(r.name) + '：' + esc(r.error || '连接失败') + '</span>' + ms) +
             '</div>';
         });
         box.innerHTML = html || '<div class="hint">无网关</div>';
@@ -2946,7 +2949,7 @@ export function adminPageHTML(subPath) {
     '<div id="chainTestRes"></div>') +
   dCard('card-res', ic('house'), '家庭 IP',
     srow(ic('power'), '模块开关', fTgl('resEnabled'), '开启后提供独立的家庭 IP 订阅（住宅网关出口）') +
-    srow(ic('server'), '住宅网关', fArea('resGateways', '每行一个：备注#host:port:user:pass\n如：日本#35.212.128.72:1080:resuser:xxx', 4), '支持 socks5://user:pass@host:port#备注 格式；多网关自动故障转移') +
+    srow(ic('server'), '住宅网关', fArea('resGateways', '每行一个：备注#host:port:user:pass\n如：日本#35.212.128.72:1080:resuser:xxx', 4), '支持 socks5://user:pass@host:port#备注 格式；多网关自动故障转移；行首加 # 临时禁用') +
     srow(ic('tag'), '节点前缀', fText('resName', '家宽'), '家庭 IP 节点名称前缀') +
     '<div style="margin:10px 0 4px"><button class="btn btn-ghost btn-sm" id="resTestBtn">' + ic('search', 15) + ' 检查住宅网关</button></div>' +
     '<div id="resTestRes"></div>' +

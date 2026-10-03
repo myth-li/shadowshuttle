@@ -575,6 +575,8 @@ console.log('[20] 家庭 IP 模块（v3.8）');
   eq('socks5 URL 格式', gw2[0], { name: '美国', host: '1.2.3.4', port: 1080, user: 'u1', pass: 'p@ss' });
   eq('非法行跳过', parseResGateways('not-a-gateway\n\n日本#1.2.3.4:1080').length, 1);
   eq('空输入', parseResGateways('').length, 0);
+  eq('# 开头禁用', parseResGateways('#日本#1.2.3.4:1080\n韩国#2.2.2.2:1081').length, 1);
+  eq('禁用后保留的', parseResGateways('#日本#1.2.3.4:1080\n韩国#2.2.2.2:1081')[0].name, '韩国');
 
   // 拨号计划：家庭 IP 模式只走网关，不回落直连
   const resCfg = {
