@@ -24,7 +24,7 @@
  * 版本变更记录见仓库根目录 CHANGELOG.md。
  */
 
-export const SS_VERSION = '3.5.0';
+export const SS_VERSION = '3.6.0';
 
 /* ------------------------------------------------------------------
  * 国家代码 → 中文国名映射表（ISO 3166-1 alpha-2）
@@ -2780,6 +2780,83 @@ function htmlResp(s) {
   return new Response(s, { headers: { 'content-type': 'text/html; charset=utf-8' } });
 }
 
+/** 手机端 IP 测速页：在用户当前网络下逐个测订阅 IP 的延迟，排出最快的。
+ *  原理：浏览器 fetch('http://IP/cdn-cgi/trace') 计时（no-cors 只测耗时）。
+ *  必须用 http:// 打开（https 页面会被浏览器拦截 http 测速请求）。
+ *  用法：/speedtest?token=<订阅token>，测完一键复制最快的 IP，贴进后台「测速结果导入」。 */
+export function speedtestPageHTML() {
+return '<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">' +
+'<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">' +
+'<title>⚡ IP 测速 · 影梭</title>' +
+'<style>body{font-family:-apple-system,system-ui,sans-serif;max-width:560px;margin:0 auto;padding:16px;background:#f6f7f9;color:#1a1a1a}' +
+'h2{margin:8px 0}.hint{color:#666;font-size:13px;line-height:1.6}' +
+'.warn{background:#fff7e6;border:1px solid #f5c542;border-radius:8px;padding:10px 12px;margin:12px 0;font-size:14px}' +
+'.btn{display:block;width:100%;padding:14px;margin:12px 0;font-size:17px;font-weight:700;color:#fff;background:#2563eb;border:none;border-radius:12px}' +
+'.btn:disabled{background:#9db4e8}.bar{height:8px;background:#e5e7eb;border-radius:4px;overflow:hidden;margin:8px 0}' +
+'.bar>i{display:block;height:100%;background:#2563eb;width:0}' +
+'table{width:100%;border-collapse:collapse;margin-top:8px;font-size:14px;background:#fff;border-radius:8px;overflow:hidden}' +
+'td,th{padding:8px 10px;border-bottom:1px solid #eee;text-align:left}.ms{color:#059669;font-weight:700}.bad{color:#dc2626}' +
+'.rowbtn{display:flex;gap:8px;margin:12px 0}.rowbtn .btn{margin:0}' +
+'#copyBtn{background:#059669}</style></head><body>' +
+'<h2>⚡ IP 测速</h2>' +
+'<p class="hint">在你<strong>当前手机网络</strong>下，逐个测试订阅里每个 IP 的延迟，按最快排序。' +
+'测完复制最快的 IP，贴进后台「优选 IP → 测速结果导入」即可。</p>' +
+'<div id="warn"></div>' +
+'<button class="btn" id="startBtn">开始测速</button>' +
+'<div class="bar" id="pbar" style="display:none"><i id="pfill"></i></div>' +
+'<div class="hint" id="ptext"></div>' +
+'<div id="result"></div>' +
+'<script>(function(){' +
+'var token=new URLSearchParams(location.search).get("token")||"";' +
+'if(!token){document.getElementById("result").innerHTML="<div class=\\"warn\\">缺少 token，地址应为 /speedtest?token=你的订阅token</div>";' +
+'document.getElementById("startBtn").disabled=true;return;}' +
+'if(location.protocol==="https:"){' +
+'document.getElementById("warn").innerHTML="<div class=\\"warn\\">⚠️ 请用 <b>http://</b> 打开本页再测（https 下浏览器会拦截测速请求）。<br><a href=\\""+location.href.replace("https://","http://")+"\\">点我切换到 http://</a></div>";}' +
+'function testIP(ip){return new Promise(function(res){' +
+'var t0=performance.now(),done=false;' +
+'var timer=setTimeout(function(){if(!done){done=true;res({ip:ip,ms:-1});}},4000);' +
+'fetch("http://"+ip+"/cdn-cgi/trace?r="+Math.random(),{mode:"no-cors",cache:"no-store"}).then(function(){' +
+'if(!done){done=true;clearTimeout(timer);res({ip:ip,ms:Math.round(performance.now()-t0)});}' +
+'}).catch(function(){if(!done){done=true;clearTimeout(timer);res({ip:ip,ms:-1});}});});}' +
+'function getIPs(){return fetch("/"+token).then(function(r){return r.text();}).then(function(t){' +
+'var dec;try{dec=atob(t.trim());}catch(e){throw new Error("订阅读取失败");}' +
+'var seen={},out=[];' +
+'dec.split("\\n").forEach(function(line){var m=line.match(/@([^:\\/?#]+)/);' +
+'if(m&&/^(\\d+\\.){3}\\d+$/.test(m[1])&&!seen[m[1]]){seen[m[1]]=1;out.push(m[1]);}});' +
+'if(!out.length)throw new Error("订阅里没有解析到 IP");return out;});}' +
+'document.getElementById("startBtn").onclick=function(){' +
+'var btn=this;btn.disabled=true;' +
+'document.getElementById("pbar").style.display="block";' +
+'document.getElementById("result").innerHTML="";' +
+'getIPs().then(function(ips){' +
+'var results=[],idx=0,concurrency=8;' +
+'function update(n,total){document.getElementById("pfill").style.width=Math.round(n/total*100)+"%";' +
+'document.getElementById("ptext").textContent="已测 "+n+" / "+total;}' +
+'return new Promise(function(resolve){' +
+'function next(){while(idx<ips.length&&next.active<concurrency){' +
+'var ip=ips[idx++];next.active++;' +
+'testIP(ip).then(function(r){next.active--;results.push(r);update(results.length,ips.length);' +
+'if(results.length===ips.length)resolve(results);else next();});}}' +
+'next.active=0;next();});' +
+'}).then(function(results){' +
+'results.sort(function(a,b){var x=a.ms<0?1e9:a.ms,y=b.ms<0?1e9:b.ms;return x-y;});' +
+'var ok=results.filter(function(r){return r.ms>=0;});' +
+'var html="<p class=\\"hint\\">测完 "+results.length+" 个，可用 "+ok.length+" 个</p><table><tr><th>#</th><th>IP</th><th>延迟</th></tr>";' +
+'ok.slice(0,30).forEach(function(r,i){' +
+'html+="<tr><td>"+(i+1)+"</td><td>"+r.ip+"</td><td class=\\"ms\\">"+r.ms+"ms</td></tr>";});' +
+'html+="</table><div class=\\"rowbtn\\"><button class=\\"btn\\" id=\\"copyBtn\\">复制最快的前 30 个</button></div>" +' +
+'"<p class=\\"hint\\">复制后去后台「优选 IP → 测速结果导入」粘贴，点导入即可。</p>";' +
+'document.getElementById("result").innerHTML=html;' +
+'document.getElementById("copyBtn").onclick=function(){' +
+'var t=ok.slice(0,30).map(function(r){return r.ip;}).join("\\n");' +
+'if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(t).then(function(){alert("已复制");});}' +
+'else{var ta=document.createElement("textarea");ta.value=t;document.body.appendChild(ta);ta.select();' +
+'try{document.execCommand("copy");alert("已复制");}catch(e){alert("复制失败，请手动复制");}ta.remove();}};' +
+'}).catch(function(e){btn.disabled=false;' +
+'document.getElementById("result").innerHTML="<div class=\\"warn\\">"+String((e&&e.message)||e)+"</div>";});};' +
+'})();<' + '/script></body></html>';
+}
+
 /** 创建登录会话：KV 存随机 token，1 小时过期 */
 async function createSession(env) {
   const kv = env.KV;
@@ -4135,6 +4212,10 @@ export default {
     if (path === '/login' && method === 'GET') return htmlResp(loginPageHTML());
     if (path === '/api/login' && method === 'POST') return handleLogin(request, env, cfg, url);
     if (path === '/api/logout' && method === 'POST') return handleLogout(request, env);
+
+    // 手机端 IP 测速页（无需会话，用 ?token= 订阅 token 取 IP 列表）
+    // 注意：请用 http:// 打开（https 下浏览器拦截 http 测速请求）
+    if (path === '/speedtest' && method === 'GET') return htmlResp(speedtestPageHTML());
 
     // 管理后台与面板 API（需要会话）
     const needSession = path === '/admin' || path === '/api/config' ||
