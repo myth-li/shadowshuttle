@@ -9,7 +9,8 @@ import {
   chacha20Poly1305Encrypt, chacha20Poly1305Decrypt,
   ssSubkey, SS_METHODS, SsDecryptor, SsEncryptor,
   parseVlessHeader, parseTrojanHeader, parseUUID, bytesEqual,
-  countryFlag, countryNameOf, buildNodeNames,
+  countryFlag, countryNameOf, buildNodeNames, queryGeoBatch, refreshGeoCache,
+  getPreferredIPs,
   buildVlessUri, buildTrojanUri, buildSsUri, buildBase64Sub, buildClashSub, buildSingboxSub,
   buildSurgeSub, buildQuanxSub, buildLoonSub,
   linesToList, isIP, base64ToBytes, bytesToBase64,
@@ -164,12 +165,17 @@ eq('name HK', countryNameOf('HK'), '香港');
 eq('name TW', countryNameOf('TW'), '台湾');
 eq('name 未知', countryNameOf('ZZ'), '未知');
 
-console.log('[8] 节点命名：分组排序 + 全局序号');
+console.log('[8] 节点命名：按国家分组 + 组内独立编号');
 {
   const ips = ['1.1.1.1', '2.2.2.2', '3.3.3.3', '4.4.4.4'];
   const geo = { '1.1.1.1': 'US', '2.2.2.2': 'HK', '3.3.3.3': null, '4.4.4.4': 'US' };
   const nodes = buildNodeNames(ips, geo);
-  eq('节点名', nodes.map((n) => n.name), ['🇭🇰 香港 01', '🇺🇸 美国 02', '🇺🇸 美国 03', '🌐 未知 04']);
+  eq('节点名', nodes.map((n) => n.name), ['🇭🇰 香港 01', '🇺🇸 美国 01', '🇺🇸 美国 02', '🌐 未知 01']);
+}
+{
+  // 备注追加在组内编号之后
+  const nodes = buildNodeNames([{ ip: '5.5.5.5', port: 0, remark: '专线' }], { '5.5.5.5': 'JP' });
+  eq('备注', nodes[0].name, '🇯🇵 日本 01 专线');
 }
 
 console.log('[9] 订阅拼装');
@@ -429,6 +435,70 @@ console.log('[23] 测速模式 / Token 轮换');
   const got = await readP;
   eq('回显内容', new TextDecoder().decode(got.value), 'ping');
   w.releaseLock(); r.releaseLock(); echo.close();
+}
+
+console.log('[24] 批量归属地查询 / 缓存补齐（stub fetch + 假 KV）');
+{
+  const realFetch = globalThis.fetch;
+  const puts = [];
+  const store = new Map([['ss:geo:9.9.9.9', 'DE']]);
+  const fakeKV = {
+    get: async (k) => (store.has(k) ? store.get(k) : null),
+    put: async (k, v, opt) => { puts.push([k, v, opt]); store.set(k, v); },
+  };
+  globalThis.fetch = async (url, init) => {
+    if (String(url).includes('ip-api.com/batch')) {
+      const body = JSON.parse(init.body);
+      return {
+        ok: true,
+        json: async () => body.map((q) => q.query === '1.1.1.1'
+          ? { query: q.query, status: 'success', countryCode: 'us' }
+          : { query: q.query, status: 'fail', message: 'reserved' }),
+      };
+    }
+    throw new Error('unexpected fetch ' + url);
+  };
+  try {
+    const got = await queryGeoBatch(['1.1.1.1', '10.0.0.1']);
+    eq('batch 解析', got, { '1.1.1.1': 'US' });
+    await refreshGeoCache(['9.9.9.9', '1.1.1.1', '10.0.0.1'], { KV: fakeKV });
+    eq('缓存命中不重查', store.get('ss:geo:9.9.9.9'), 'DE');
+    eq('成功写入', store.get('ss:geo:1.1.1.1'), 'US');
+    eq('失败记 ??', store.get('ss:geo:10.0.0.1'), '??');
+    const failPut = puts.find((p) => p[0] === 'ss:geo:10.0.0.1');
+    eq('失败短 TTL', failPut[2].expirationTtl, 3600);
+    const okPut = puts.find((p) => p[0] === 'ss:geo:1.1.1.1');
+    eq('成功长 TTL', okPut[2].expirationTtl, 30 * 86400);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+}
+
+console.log('[25] 优选 IP 数量语义：总数目标，随机补足差额');
+{
+  const realFetch = globalThis.fetch;
+  const fakeKV = { get: async () => null, put: async () => {} };
+  globalThis.fetch = async (url) => {
+    if (String(url).includes('cloudflare.com/ips-v4')) {
+      return { ok: true, text: async () => '10.0.0.0/28\n' }; // 10.0.0.1~10.0.0.14
+    }
+    throw new Error('unexpected fetch ' + url);
+  };
+  try {
+    const cfg = { preferredStatic: ['1.1.1.1', '2.2.2.2#备注'], preferredSources: [], randIPCount: 5, randIPPort: 0 };
+    const entries = await getPreferredIPs(cfg, { KV: fakeKV });
+    eq('总数=目标', entries.length, 5);
+    eq('静态优先', entries.slice(0, 2).map((e) => e.ip), ['1.1.1.1', '2.2.2.2']);
+    eq('静态备注保留', entries[1].remark, '备注');
+    const cfg2 = { preferredStatic: ['1.1.1.1', '2.2.2.2', '3.3.3.3'], preferredSources: [], randIPCount: 2, randIPPort: 0 };
+    const entries2 = await getPreferredIPs(cfg2, { KV: fakeKV });
+    eq('静态超量不裁剪', entries2.length, 3);
+    const cfg3 = { preferredStatic: ['1.1.1.1'], preferredSources: [], randIPCount: 0, randIPPort: 0 };
+    const entries3 = await getPreferredIPs(cfg3, { KV: fakeKV });
+    eq('0=关闭随机', entries3.length, 1);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
 }
 
 console.log(`\n结果：${pass} 通过，${fail} 失败`);

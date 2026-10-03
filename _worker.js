@@ -24,7 +24,7 @@
  * 版本变更记录见仓库根目录 CHANGELOG.md。
  */
 
-export const SS_VERSION = '3.0.0';
+export const SS_VERSION = '3.1.0';
 
 /* ------------------------------------------------------------------
  * 国家代码 → 中文国名映射表（ISO 3166-1 alpha-2）
@@ -744,7 +744,7 @@ const DEFAULT_CONFIG = {
   // —— 优选 IP ——
   preferredSources: [],     // 优选 IP 源 URL 列表（支持 https:// 文本源与 sub:// 聚合源）
   preferredStatic: [],      // 静态优选 IP 列表（支持 IP / IP:端口 / IP#备注）
-  randIPCount: 16,          // 内置随机优选 IP 生成数量（0=关闭）
+  randIPCount: 16,          // 订阅节点总数目标（静态+来源优先，随机补足差额；0=关闭随机）
   randIPPort: 443,          // 随机优选 IP 端口
   // —— 出站 ——
   proxyIP: '',              // 回落 IP（出站失败时重试）
@@ -1037,7 +1037,10 @@ export async function genRandomPreferredIPs(count, env, rand) {
 }
 
 /** 全部优选 IP 条目（去重）：静态 + 各源抓取 + 随机生成。
- *  返回 [{ip, port, remark}]，port 为 0 表示用节点默认端口。 */
+ *  返回 [{ip, port, remark}]，port 为 0 表示用节点默认端口。
+ *  数量语义：randIPCount 是订阅节点总数目标。静态条目与来源抓取的 IP
+ *  优先保留，随机生成只补足差额（设 99、静态 3 个 → 随机补 96 个）。
+ *  randIPCount 为 0 时关闭随机补足，节点数 = 静态 + 来源。 */
 export async function getPreferredIPs(cfg, env) {
   const seen = new Set();
   const out = [];
@@ -1055,18 +1058,24 @@ export async function getPreferredIPs(cfg, env) {
   const kv = env.KV;
   const results = await Promise.all((cfg.preferredSources || []).map((u) => fetchSourceIPs(u, kv)));
   for (const ips of results) for (const ip of ips) push(ip, 0, '');
-  // 4. 随机生成
+  // 4. 随机生成：补足到总数目标
   if (cfg.randIPCount > 0) {
-    const rnd = await genRandomPreferredIPs(cfg.randIPCount, env);
-    for (const ip of rnd) push(ip, cfg.randIPPort || 0, '');
+    const need = Math.max(0, cfg.randIPCount - out.length);
+    if (need > 0) {
+      const rnd = await genRandomPreferredIPs(need, env);
+      for (const ip of rnd) push(ip, cfg.randIPPort || 0, '');
+    }
   }
   return out;
 }
 
 /* ------------------------------------------------------------------
- * IP 归属地：ip-api.com（免费，无需 key），KV 缓存 30 天。
- * 订阅生成时只读缓存；缺失的在后台（waitUntil）异步补齐，
- * 缺失时节点先显示 🌐 未知，不阻塞订阅。
+ * IP 归属地：ip-api.com（免费，无需 key），KV 缓存。
+ * 订阅生成时只读缓存；缺失的在后台（waitUntil）用 /batch 接口一次性
+ * 补齐（单次最多 100 个 IP），缺失时节点先显示 🌐 未知，不阻塞订阅。
+ * 成功结果缓存 30 天；查询失败只缓存 1 小时，避免长期污染。
+ * 之前串行 1.4s/IP 的写法在 IP 多时 waitUntil 跑不完，缓存永远补不齐，
+ * 这就是订阅里长期显示"未知"的根因。
  * ------------------------------------------------------------------ */
 async function queryGeo(ip) {
   try {
@@ -1079,6 +1088,33 @@ async function queryGeo(ip) {
     if (j && j.status === 'success' && j.countryCode) return String(j.countryCode).toUpperCase();
   } catch { /* 忽略 */ }
   return null;
+}
+
+/** 批量归属地查询：POST /batch，一次最多 100 个 IP，返回 {ip: 国家代码} */
+export async function queryGeoBatch(ips) {
+  const out = {};
+  if (!ips || !ips.length) return out;
+  try {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 20000);
+    const res = await fetch('http://ip-api.com/batch', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(ips.map((ip) => ({ query: ip, fields: 'status,countryCode,query' }))),
+      signal: ctrl.signal,
+    });
+    clearTimeout(timer);
+    if (!res.ok) return out;
+    const arr = await res.json();
+    if (Array.isArray(arr)) {
+      for (const j of arr) {
+        if (j && j.status === 'success' && j.countryCode && j.query) {
+          out[String(j.query)] = String(j.countryCode).toUpperCase();
+        }
+      }
+    }
+  } catch { /* 忽略 */ }
+  return out;
 }
 
 /** 读缓存的归属地；miss 返回 null（调用方负责后台补齐） */
@@ -1095,27 +1131,42 @@ export async function getCachedGeo(ip, env) {
 export async function refreshGeoCache(ips, env) {
   const kv = env.KV;
   if (!kv) return;
-  const missing = [];
-  for (const ip of ips) {
-    try {
-      if (!(await kv.get(KV_GEO_PREFIX + ip))) missing.push(ip);
-    } catch { /* 忽略 */ }
-  }
-  // 限速：ip-api 免费版 45 次/分钟，这里串行 + 小间隔
-  for (const ip of missing) {
-    const code = await queryGeo(ip);
-    try {
-      await kv.put(KV_GEO_PREFIX + ip, code || '??', { expirationTtl: 30 * 86400 });
-    } catch { /* 忽略 */ }
-    await new Promise((r) => setTimeout(r, 1400));
+  const uniq = [...new Set(ips || [])].filter(Boolean);
+  if (!uniq.length) return;
+  // 并行查缓存，找出缺失的
+  const flags = await Promise.all(uniq.map(async (ip) => {
+    try { return await kv.get(KV_GEO_PREFIX + ip); } catch { return null; }
+  }));
+  const missing = uniq.filter((_, i) => !flags[i]);
+  if (!missing.length) return;
+  // 批量查询（每批 100），全部失败才回退串行单个查询
+  for (let i = 0; i < missing.length; i += 100) {
+    const batch = missing.slice(i, i + 100);
+    let got = await queryGeoBatch(batch);
+    if (!Object.keys(got).length && batch.length) {
+      got = {};
+      for (const ip of batch) {
+        const code = await queryGeo(ip);
+        if (code) got[ip] = code;
+        await new Promise((r) => setTimeout(r, 1400));
+      }
+    }
+    for (const ip of batch) {
+      const code = got[ip] || null;
+      try {
+        await kv.put(KV_GEO_PREFIX + ip, code || '??',
+          { expirationTtl: code ? 30 * 86400 : 3600 });
+      } catch { /* 忽略 */ }
+    }
   }
 }
 
 /* ------------------------------------------------------------------
  * 订阅节点组装
- * 命名：{国旗emoji}{中文国名} {全局序号}，如 🇺🇸 美国 01；
+ * 命名：{国旗emoji}{中文国名} {组内序号}，如 🇺🇸 美国 01；
  * 条目带 #备注 时追加在末尾，如 🇺🇸 美国 01 香港专线。
- * 排序：按国家代码分组，组内按 IP 排序，组按代码排序；全局编号 01..NN
+ * 排序：按国家代码分组（未知归属地 '??' 排最后），组内按 IP 排序；
+ * 每个国家组内独立编号 01..NN（不同国家序号不混排）。
  * 每个 IP 生成 VLESS / Trojan / SS 各一条（按配置启用的协议）
  * 输入兼容旧格式的字符串数组（自动转为条目）。
  * ------------------------------------------------------------------ */
@@ -1124,18 +1175,21 @@ export function buildNodeNames(entries, geoMap) {
     const en = typeof e === 'string' ? { ip: e, port: 0, remark: '' } : e;
     return { ip: en.ip, port: en.port || 0, remark: en.remark || '', code: (geoMap || {})[en.ip] || '??' };
   });
-  // 按国家代码排序，未知归属地（'??'）排在最后；同国家内按 IP 排；最后全局编号 01..NN
+  // 按国家代码分组，未知归属地（'??'）排在最后；同国家内按 IP 排
   items.sort((a, b) => {
     const au = a.code === '??', bu = b.code === '??';
     if (au !== bu) return au ? 1 : -1;
     if (a.code !== b.code) return a.code < b.code ? -1 : 1;
     return a.ip < b.ip ? -1 : a.ip > b.ip ? 1 : 0;
   });
-  return items.map((it, i) => {
+  // 每组独立编号：🇺🇸 美国 01、🇺🇸 美国 02、🇨🇦 加拿大 01……
+  const counters = Object.create(null);
+  return items.map((it) => {
     const known = it.code !== '??';
     const flag = known ? countryFlag(it.code) : '🌐';
     const name = known ? countryNameOf(it.code) : '未知';
-    const num = String(i + 1).padStart(2, '0');
+    const n = (counters[it.code] = (counters[it.code] || 0) + 1);
+    const num = String(n).padStart(2, '0');
     const full = `${flag} ${name} ${num}` + (it.remark ? ` ${it.remark}` : '');
     return { ip: it.ip, port: it.port, code: it.code, name: full };
   });
@@ -2200,9 +2254,9 @@ function adminApp(SUB_INIT) {
     $('stSsSub').textContent = ssOk ? '已配置' : '未配置';
     var stN = nonEmptyLines(cfg.preferredStatic).length;
     var srcN = nonEmptyLines(cfg.preferredSources).length;
-    var rnd = srcN ? (parseInt(cfg.randIPCount, 10) || 0) : 0;
-    $('stIpNum').textContent = stN + rnd;
-    $('stIpSub').textContent = '静态 ' + stN + ' · 随机 ' + rnd + ' / 源';
+    var target = parseInt(cfg.randIPCount, 10) || 0;
+    $('stIpNum').textContent = target > 0 ? target : (stN + ' + 源');
+    $('stIpSub').textContent = '静态 ' + stN + ' · 来源 ' + srcN + ' 个' + (target > 0 ? ' · 随机补足至 ' + target : '');
   }
 
   /* ---------- Cloudflare 用量（概览 + 节点配置页共用） ---------- */
@@ -2502,7 +2556,7 @@ export function adminPageHTML(subPath) {
       '支持 https:// 与 sub:// 两种来源，每行一个') +
     srow('📌', '静态优选', fArea('preferredStatic', '每行一个，支持 IP / IP:端口 / IP#备注', 3),
       '手动指定的固定 IP，优先级最高') +
-    srow('🎲', '随机数量', fNum('randIPCount', '16'), '每个优选源随机抽取的 IP 数，默认 16') +
+    srow('🎲', '随机数量', fNum('randIPCount', '16'), '订阅节点总数目标：静态 IP 与来源 IP 优先保留，不足部分随机补足。设 0 关闭随机补足') +
     srow('🔌', '随机端口', fNum('randIPPort', '443')) +
     '<div style="margin:10px 0 4px"><button class="btn btn-ghost btn-sm" id="srcTestBtn">🔍 验证优选源</button></div>' +
     '<div id="srcTestRes"></div>',
@@ -2703,12 +2757,21 @@ function handleGetConfig(cfg, env) {
   });
 }
 
-async function handlePostConfig(request, env) {
+async function handlePostConfig(request, env, ctx) {
   let body;
   try { body = await request.json(); } catch { return json({ error: '请求格式错误' }, 400); }
   try {
     await saveConfig(env, body || {});
     const cfg = await loadConfig(env);
+    // 后台预热归属地缓存：下次拉订阅时节点名直接显示国家，不用等
+    if (ctx && ctx.waitUntil) {
+      ctx.waitUntil((async () => {
+        try {
+          const entries = await getPreferredIPs(cfg, env);
+          await refreshGeoCache(entries.map((e) => e.ip), env);
+        } catch { /* 忽略 */ }
+      })());
+    }
     return json({ ok: true, subPath: cfg.subPath });
   } catch (e) {
     return json({ error: e.message || '保存失败' }, 500);
@@ -3977,7 +4040,7 @@ export default {
       if (path === '/api/cf-usage') return handleCfUsage(env, cfg);
       if (path === '/api/check-proxy') return handleCheckProxy(env, cfg);
       if (method === 'GET') return handleGetConfig(cfg, env);
-      if (method === 'POST') return handlePostConfig(request, env);
+      if (method === 'POST') return handlePostConfig(request, env, ctx);
       return new Response('method not allowed', { status: 405 });
     }
 
