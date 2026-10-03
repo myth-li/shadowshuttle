@@ -21,6 +21,7 @@ import {
   socks5Greeting, socks5AuthRequest, socks5ConnectRequest, expandIPv6, socks5CheckReply,
   buildHttpConnectReq, indexOfSeq, chainAllows, chainNeedsTls,
   buildDialPlan, computeDialTimeout, raceDials,
+  parseResGateways, buildResVlessUri, buildResBase64Sub, buildResClashSub, buildResSingboxSub,
   parseTrojanFallback,
   isSpeedtestTarget, rotatedSubToken, utcToday, localEchoSocket,
   clampPort, clampInt,
@@ -560,6 +561,55 @@ console.log('[27] IPinfo 归属地查询（stub fetch）');
   } finally {
     globalThis.fetch = realFetch;
   }
+}
+
+console.log('[20] 家庭 IP 模块（v3.8）');
+{
+  // 网关解析：两种格式
+  const gw1 = parseResGateways('日本#35.212.128.72:1080:resuser:pass123\n韩国#35.212.128.72:1081:resuser:pass123');
+  eq('网关解析数量', gw1.length, 2);
+  eq('网关1', gw1[0], { name: '日本', host: '35.212.128.72', port: 1080, user: 'resuser', pass: 'pass123' });
+  eq('网关2端口', gw1[1].port, 1081);
+  const gw2 = parseResGateways('socks5://u1:p%40ss@1.2.3.4:1080#美国');
+  eq('socks5 URL 格式', gw2[0], { name: '美国', host: '1.2.3.4', port: 1080, user: 'u1', pass: 'p@ss' });
+  eq('非法行跳过', parseResGateways('not-a-gateway\n\n日本#1.2.3.4:1080').length, 1);
+  eq('空输入', parseResGateways('').length, 0);
+
+  // 拨号计划：家庭 IP 模式只走网关，不回落直连
+  const resCfg = {
+    resForce: true, resGatewayIdx: 0,
+    resGateways: [{ name: '日本', host: '1.1.1.1', port: 1080 }, { name: '韩国', host: '2.2.2.2', port: 1081 }],
+  };
+  const plan = buildDialPlan('example.com', resCfg);
+  eq('家庭IP拨号计划长度', plan.length, 2);
+  eq('主网关优先', plan[0], { kind: 'res', gw: 0 });
+  eq('故障转移到网关2', plan[1], { kind: 'res', gw: 1 });
+  ok('无 direct 回落', !plan.some((p) => p.kind === 'direct'));
+  // 主网关为第2个时顺序调整
+  const plan2 = buildDialPlan('example.com', { ...resCfg, resGatewayIdx: 1 });
+  eq('主网关切换', plan2[0], { kind: 'res', gw: 1 });
+  eq('故障转移回网关1', plan2[1], { kind: 'res', gw: 0 });
+  // 非家庭 IP 模式不受影响
+  const normalPlan = buildDialPlan('example.com', { chainEnabled: false });
+  ok('普通模式有 direct', normalPlan.some((p) => p.kind === 'direct'));
+
+  // 订阅构建
+  const nodes = [
+    { ip: 'worker.example.com', port: 443, gwIdx: 0, name: '家宽-日本' },
+    { ip: 'worker.example.com', port: 443, gwIdx: 1, name: '家宽-韩国' },
+  ];
+  const testCfg = { UUID: '12345678-1234-1234-1234-123456789abc', resName: '家宽' };
+  const uri = buildResVlessUri(nodes[0], testCfg.UUID, 'worker.example.com', testCfg);
+  ok('VLESS URI 含 residential 路径', uri.includes('path=/res/0/' + testCfg.UUID));
+  ok('VLESS URI 含节点名', uri.includes(encodeURIComponent('家宽-日本')));
+  const b64 = buildResBase64Sub(nodes, testCfg, 'worker.example.com');
+  ok('base64 订阅非空', b64.length > 50);
+  const clash = buildResClashSub(nodes, testCfg, 'worker.example.com');
+  ok('clash 含 ws 路径', clash.includes('path: /res/1/' + testCfg.UUID));
+  const sb = buildResSingboxSub(nodes, testCfg, 'worker.example.com');
+  const sbj = JSON.parse(sb);
+  eq('singbox 节点数', sbj.outbounds.length, 2);
+  eq('singbox 路径', sbj.outbounds[0].transport.path, '/res/0/' + testCfg.UUID);
 }
 
 console.log(`\n结果：${pass} 通过，${fail} 失败`);

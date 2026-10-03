@@ -24,7 +24,7 @@
  * 版本变更记录见仓库根目录 CHANGELOG.md。
  */
 
-export const SS_VERSION = '3.6.0';
+export const SS_VERSION = '3.8.0';
 
 /* ------------------------------------------------------------------
  * 国家代码 → 中文国名映射表（ISO 3166-1 alpha-2）
@@ -761,6 +761,10 @@ const DEFAULT_CONFIG = {
   chainUser: '',            // 链式代理账号（可空）
   chainPass: '',            // 链式代理密码（可空）
   chainWhitelist: [],       // 域名白名单（空=全部走链；否则仅名单内走链）
+  // —— 家庭 IP（住宅网关） ——
+  resEnabled: false,        // 家庭 IP 模块开关
+  resGateways: [],          // 住宅网关列表，每行：备注#host:port:user:pass
+  resName: '家宽',           // 家庭 IP 节点名前缀
   // —— 日志与通知 ——
   logEnabled: false,        // KV 请求日志开关
   tgEnabled: false,         // Telegram 推送开关
@@ -778,6 +782,42 @@ const DEFAULT_CONFIG = {
 export function linesToList(s) {
   if (Array.isArray(s)) return [...new Set(s.map((x) => String(x).trim()).filter(Boolean))];
   return [...new Set(String(s || '').split('\n').map((x) => x.trim()).filter(Boolean))];
+}
+
+/** 家庭 IP 网关列表解析。
+ * 支持两种格式（每行一个）：
+ *   备注#host:port:user:pass       （如：日本#35.212.128.72:1080:resuser:xxx）
+ *   socks5://user:pass@host:port#备注
+ * 返回 [{name, host, port, user, pass}]，非法行跳过。 */
+export function parseResGateways(input) {
+  const out = [];
+  for (const line of linesToList(input)) {
+    let name = '', host = '', port = 1080, user = '', pass = '';
+    if (/^socks5:\/\//i.test(line)) {
+      try {
+        const u = new URL(line);
+        user = decodeURIComponent(u.username || '');
+        pass = decodeURIComponent(u.password || '');
+        host = u.hostname || '';
+        port = u.port ? parseInt(u.port, 10) : 1080;
+        name = decodeURIComponent(u.hash ? u.hash.slice(1) : '');
+      } catch { continue; }
+    } else {
+      const hashIdx = line.indexOf('#');
+      const main = hashIdx >= 0 ? line.slice(hashIdx + 1).trim() : line.trim();
+      name = hashIdx >= 0 ? line.slice(0, hashIdx).trim() : '';
+      const parts = main.split(':');
+      if (parts.length < 2) continue;
+      host = parts[0].trim();
+      port = parseInt(parts[1], 10) || 1080;
+      user = (parts[2] || '').trim();
+      pass = parts.slice(3).join(':').trim();
+    }
+    if (!host) continue;
+    if (!name) name = host;
+    out.push({ name, host, port: clampPort(port, 1080), user, pass });
+  }
+  return out;
 }
 
 /** 端口钳制：非法时回退默认值 */
@@ -892,6 +932,9 @@ export async function saveConfig(env, input) {
   cfg.chainUser = String(input.chainUser || '');
   cfg.chainPass = String(input.chainPass || '');
   cfg.chainWhitelist = linesToList(input.chainWhitelist);
+  cfg.resEnabled = !!input.resEnabled;
+  cfg.resGateways = parseResGateways(input.resGateways);
+  cfg.resName = String(input.resName || '家宽').trim() || '家宽';
   cfg.dialRace = !!input.dialRace;
   cfg.dialConcurrency = clampInt(input.dialConcurrency, 2, 5, 3);
   cfg.dialTimeoutMs = clampInt(input.dialTimeoutMs, 0, 30000, 0);
@@ -1320,6 +1363,98 @@ export function buildBase64Sub(nodes, cfg, host, extraLinks) {
 
 function yamlStr(s) {
   return `"${String(s).replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+}
+
+/* ------------------------------------------------------------------
+ * 家庭 IP 订阅构建（v3.8）
+ * 每个网关生成一个节点，服务器为 Worker 自身域名，
+ * WS 路径 /res/<网关序号>/...，出站强制走对应住宅网关。
+ * ------------------------------------------------------------------ */
+
+/** 家庭 IP VLESS URI */
+export function buildResVlessUri(node, uuid, host, cfg) {
+  let params = `encryption=none&security=tls&sni=${host}&fp=chrome&type=ws&host=${host}&path=/res/${node.gwIdx}/${uuid}`;
+  params += subExtraParams(cfg || {});
+  return `vless://${uuid}@${node.ip}:443?${params}#${encodeURIComponent(node.name)}`;
+}
+
+/** 家庭 IP 通用 base64 订阅 */
+export function buildResBase64Sub(nodes, cfg, host) {
+  const lines = [];
+  nodes.forEach((n, i) => {
+    const h = pickHost(cfg, host, i);
+    lines.push(buildResVlessUri(n, cfg.UUID, h, cfg));
+    if (cfg.trojanPassword) {
+      const params = `security=tls&sni=${h}&fp=chrome&type=ws&host=${h}&path=/res/${n.gwIdx}/trojan` + subExtraParams(cfg);
+      lines.push(`trojan://${encodeURIComponent(cfg.trojanPassword)}@${n.ip}:443?${params}#${encodeURIComponent(n.name + ' Trojan')}`);
+    }
+    if (cfg.ssPassword) {
+      const userinfo = bytesToBase64(te.encode(`${cfg.ssMethod}:${cfg.ssPassword}`));
+      const plugin = encodeURIComponent(`v2ray-plugin;tls;host=${h};path=/res/${n.gwIdx}/ss`);
+      lines.push(`ss://${userinfo}@${n.ip}:443/?plugin=${plugin}#${encodeURIComponent(n.name + ' SS')}`);
+    }
+  });
+  return bytesToBase64(te.encode(lines.join('\n')));
+}
+
+/** 家庭 IP Clash 订阅 */
+export function buildResClashSub(nodes, cfg, host) {
+  const L = ['proxies:'];
+  nodes.forEach((n, i) => {
+    const h = pickHost(cfg, host, i);
+    const name = yamlStr(n.name);
+    L.push(`  - name: ${name}`);
+    L.push(`    type: vless`);
+    L.push(`    server: ${n.ip}`);
+    L.push(`    port: 443`);
+    L.push(`    uuid: ${cfg.UUID}`);
+    L.push(`    tls: true`);
+    L.push(`    servername: ${h}`);
+    L.push(`    client-fingerprint: chrome`);
+    L.push(`    network: ws`);
+    L.push(`    ws-opts:`);
+    L.push(`      path: /res/${n.gwIdx}/${cfg.UUID}`);
+    L.push(`      headers: { Host: ${h} }`);
+  });
+  return L.join('\n') + '\n';
+}
+
+/** 家庭 IP sing-box 订阅 */
+export function buildResSingboxSub(nodes, cfg, host) {
+  const outbounds = nodes.map((n, i) => {
+    const h = pickHost(cfg, host, i);
+    return {
+      type: 'vless', tag: n.name, server: n.ip, server_port: 443, uuid: cfg.UUID,
+      tls: { enabled: true, server_name: h, utls: { enabled: true, fingerprint: 'chrome' } },
+      transport: { type: 'ws', path: `/res/${n.gwIdx}/${cfg.UUID}`, headers: { Host: h } },
+    };
+  });
+  return JSON.stringify({ outbounds }, null, 2);
+}
+
+/** 家庭 IP Surge 订阅 */
+export function buildResSurgeSub(nodes, cfg, host) {
+  return nodes.map((n, i) => {
+    const h = pickHost(cfg, host, i);
+    const tag = n.name.replace(/,/g, ' ');
+    return `${tag} = vless, ${n.ip}, 443, username=${cfg.UUID}, tls=true, sni=${h}, ws=true, ws-path=/res/${n.gwIdx}/${cfg.UUID}, ws-headers=Host:${h}`;
+  }).join('\n') + '\n';
+}
+
+/** 家庭 IP Quantumult X 订阅 */
+export function buildResQuanxSub(nodes, cfg, host) {
+  return nodes.map((n, i) => {
+    const h = pickHost(cfg, host, i);
+    return `vless=${n.ip}:443, method=none, password=${cfg.UUID}, tls=true, sni=${h}, ws=true, ws-path=/res/${n.gwIdx}/${cfg.UUID}, ws-headers=Host:${h}, tag=${n.name.replace(/,/g, ' ')}`;
+  }).join('\n') + '\n';
+}
+
+/** 家庭 IP Loon 订阅 */
+export function buildResLoonSub(nodes, cfg, host) {
+  return nodes.map((n, i) => {
+    const h = pickHost(cfg, host, i);
+    return `${n.name} = vless, ${n.ip}, 443, username=${cfg.UUID}, tls=true, sni=${h}, ws=true, ws-path=/res/${n.gwIdx}/${cfg.UUID}, ws-headers=Host:${h}`;
+  }).join('\n') + '\n';
 }
 
 /** Clash YAML 订阅 */
@@ -2346,6 +2481,7 @@ function adminApp(SUB_INIT) {
     ['ipinfoToken', 't'],
     ['proxyIP', 't'], ['speedtestDomains', 'ta'], ['chainEnabled', 'b'], ['chainType', 'pill'], ['chainHost', 't'], ['chainPort', 'n'],
     ['chainUser', 't'], ['chainPass', 't'], ['chainWhitelist', 'ta'],
+    ['resEnabled', 'b'], ['resGateways', 'ta'], ['resName', 't'],
     ['dialRace', 'b'], ['dialConcurrency', 'n'], ['dialTimeoutMs', 'n'],
     ['hosts', 'ta'], ['nodePort', 'n'], ['subKey', 't'], ['subTokenRotate', 'b'], ['earlyData', 'b'], ['fragment', 'b'],
     ['disguiseHTML', 'ta'],
@@ -2602,6 +2738,33 @@ function adminApp(SUB_INIT) {
     });
   };
 
+  /* ---------- 住宅网关检查 ---------- */
+  $('resTestBtn').onclick = function () {
+    var box = $('resTestRes');
+    var btn = this;
+    btn.disabled = true;
+    box.innerHTML = '<div class="hint">正在检查各网关…</div>';
+    getJSON('api/check-res').then(function (j) {
+      btn.disabled = false;
+      if (j && j.ok && j.results) {
+        var html = '';
+        j.results.forEach(function (r) {
+          html += '<div class="trow">' +
+            (r.ok ? '<span class="ok">' + esc(r.name) + '：出口 ' + esc(r.ip) + '（' + esc(r.country || '未知地区') + '）</span>'
+                  : '<span class="bad">' + esc(r.name) + '：' + esc(r.error || '连接失败') + '</span>') +
+            '</div>';
+        });
+        box.innerHTML = html || '<div class="hint">无网关</div>';
+      } else {
+        box.innerHTML = '<div class="trow"><span class="bad">' + esc((j && j.error) || '检查失败') + '</span></div>';
+      }
+    }).catch(function (e) {
+      btn.disabled = false;
+      if (!e || e.message !== 'unauthorized')
+        box.innerHTML = '<div class="trow"><span class="bad">请求失败</span></div>';
+    });
+  };
+
   /* ---------- 查看日志（弹窗表格） ---------- */
   $('logBtn').onclick = function () {
     getJSON('api/logs').then(function (j) {
@@ -2636,7 +2799,14 @@ function adminApp(SUB_INIT) {
     var box = $('subList');
     var host = $('hostSel').value || location.host;
     box.innerHTML = '';
-    SUBS.forEach(function (d, i) {
+    var allSubs = SUBS.slice();
+    // 家庭 IP 独立订阅（仅当模块开启时显示）
+    if (fieldEl('resEnabled') && fieldEl('resEnabled').checked) {
+      allSubs.push(['家庭 IP · 通用', '/res', '家庭 IP 独立订阅（v2rayN / Shadowrocket）']);
+      allSubs.push(['家庭 IP · Clash', '/res/clash', '家庭 IP 独立订阅（Clash）']);
+      allSubs.push(['家庭 IP · sing-box', '/res/singbox', '家庭 IP 独立订阅（sing-box）']);
+    }
+    allSubs.forEach(function (d, i) {
       var url = location.protocol + '//' + host + subPath + d[1];
       var item = document.createElement('div');
       item.className = 'subitem';
@@ -2774,6 +2944,13 @@ export function adminPageHTML(subPath) {
     srow(ic('timer'), '拨号超时', fNum('dialTimeoutMs', '0'), '毫秒；0=自适应（弱网自动收紧超时）') +
     '<div style="margin:10px 0 4px"><button class="btn btn-ghost btn-sm" id="chainTestBtn">' + ic('search', 15) + ' 检查链式代理</button></div>' +
     '<div id="chainTestRes"></div>') +
+  dCard('card-res', ic('house'), '家庭 IP',
+    srow(ic('power'), '模块开关', fTgl('resEnabled'), '开启后提供独立的家庭 IP 订阅（住宅网关出口）') +
+    srow(ic('server'), '住宅网关', fArea('resGateways', '每行一个：备注#host:port:user:pass\n如：日本#35.212.128.72:1080:resuser:xxx', 4), '支持 socks5://user:pass@host:port#备注 格式；多网关自动故障转移') +
+    srow(ic('tag'), '节点前缀', fText('resName', '家宽'), '家庭 IP 节点名称前缀') +
+    '<div style="margin:10px 0 4px"><button class="btn btn-ghost btn-sm" id="resTestBtn">' + ic('search', 15) + ' 检查住宅网关</button></div>' +
+    '<div id="resTestRes"></div>' +
+    '<div class="hint">独立订阅路径：<code id="resSubPathHint">…</code>（只含家庭 IP 节点）</div>') +
   dCard('card-sub', ic('file-text'), '订阅参数',
     srow(ic('earth'), '订阅 HOST', fArea('hosts', '每行一个域名', 2), '多 HOST 轮换，订阅页可切换') +
     srow(ic('plug'), '节点端口', fNum('nodePort', '443')) +
@@ -3017,6 +3194,9 @@ function handleGetConfig(cfg, env) {
     chainUser: cfg.chainUser,
     chainPass: '', // 密码不回显，前端留空=不修改
     chainWhitelist: cfg.chainWhitelist,
+    resEnabled: cfg.resEnabled,
+    resGateways: (cfg.resGateways || []).map((g) => `${g.name}#${g.host}:${g.port}:${g.user}:${g.pass}`).join('\n'),
+    resName: cfg.resName,
     dialRace: cfg.dialRace,
     dialConcurrency: cfg.dialConcurrency,
     dialTimeoutMs: cfg.dialTimeoutMs,
@@ -3226,6 +3406,28 @@ async function handleCheckProxy(env, cfg) {
   }
 }
 
+/** GET /api/check-res：逐个检查住宅网关，返回各网关出口 IP */
+async function handleCheckRes(env, cfg) {
+  if (!cfg.resGateways || !cfg.resGateways.length) {
+    return json({ ok: false, error: '未配置住宅网关' });
+  }
+  const results = [];
+  for (const gw of cfg.resGateways) {
+    try {
+      const c2 = { ...cfg, chainType: 'socks5', chainHost: gw.host, chainPort: gw.port, chainUser: gw.user, chainPass: gw.pass };
+      const sock = await socks5Dial(c2, 'api.ipify.org', 80);
+      const body = await httpGetBodyViaSocket(sock, 'api.ipify.org', '/');
+      const ip = body.split('\n')[0].trim();
+      if (!isIP(ip)) throw new Error('出口 IP 解析失败');
+      const geo = await getCachedGeo(ip, env).catch(() => null);
+      results.push({ name: gw.name, ok: true, ip, country: geo ? countryNameOf(geo) : '' });
+    } catch (e) {
+      results.push({ name: gw.name, ok: false, error: String(e && e.message || e).slice(0, 80) });
+    }
+  }
+  return json({ ok: true, results });
+}
+
 /* ------------------------------------------------------------------
  * 订阅接口
  * ------------------------------------------------------------------ */
@@ -3238,7 +3440,31 @@ async function handleCheckProxy(env, cfg) {
  * ------------------------------------------------------------------ */
 async function handleSub(request, env, ctx, cfg, host, explicitFormat) {
   if (!cfg.UUID) return new Response('UUID 未配置', { status: 500 });
+  const isRes = String(explicitFormat || '').startsWith('res');
+  if (isRes && (!cfg.resEnabled || !cfg.resGateways || !cfg.resGateways.length)) {
+    return new Response('residential disabled', { status: 404 });
+  }
   const url = new URL(request.url);
+  // 家庭 IP 订阅：每个网关一个节点，服务器为 Worker 自身域名，路径带网关序号
+  if (isRes) {
+    const resFormat = String(explicitFormat).slice(4) || detectSubFormat(request, null);
+    const nodes = cfg.resGateways.map((gw, i) => ({
+      ip: host, port: 443, gwIdx: i,
+      name: `${cfg.resName || '家宽'}-${gw.name}`,
+    }));
+    const le = logEntryOf(request);
+    if (cfg.logEnabled) ctx.waitUntil(appendLog(env, le));
+    if (cfg.tgEnabled) {
+      ctx.waitUntil(tgNotify(env, cfg,
+        `📥 有人拉取家庭IP订阅\nIP: ${le.ip || '未知'}${le.cc ? ' (' + le.cc + ')' : ''}\n格式: ${resFormat}\nUA: ${le.ua || '-'}\n时间: ${new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })}`));
+    }
+    if (resFormat === 'clash') return new Response(buildResClashSub(nodes, cfg, host), { headers: { 'content-type': 'text/yaml; charset=utf-8' } });
+    if (resFormat === 'singbox') return new Response(buildResSingboxSub(nodes, cfg, host), { headers: { 'content-type': 'application/json; charset=utf-8' } });
+    if (resFormat === 'surge') return new Response(buildResSurgeSub(nodes, cfg, host), { headers: { 'content-type': 'text/plain; charset=utf-8' } });
+    if (resFormat === 'quanx') return new Response(buildResQuanxSub(nodes, cfg, host), { headers: { 'content-type': 'text/plain; charset=utf-8' } });
+    if (resFormat === 'loon') return new Response(buildResLoonSub(nodes, cfg, host), { headers: { 'content-type': 'text/plain; charset=utf-8' } });
+    return new Response(buildResBase64Sub(nodes, cfg, host), { headers: { 'content-type': 'text/plain; charset=utf-8' } });
+  }
   const format = detectSubFormat(request, explicitFormat);
   // 优选 IP 条目（含端口/备注）
   const entries = await getPreferredIPs(cfg, env);
@@ -3581,8 +3807,16 @@ async function dialViaChain(addr, port, cfg) {
  * ------------------------------------------------------------------ */
 
 /** 纯函数：按配置排出拨号尝试顺序（链式→直连→回落）。
- * 抽出来一是单测可覆盖顺序逻辑，二是串行/并发两种模式共用一份顺序。 */
+ * 抽出来一是单测可覆盖顺序逻辑，二是串行/并发两种模式共用一份顺序。
+ * 家庭 IP 模式（cfg.resForce）：只走住宅网关，主网关优先、其余按序故障转移，
+ * 不回落直连（保证出口 IP 始终为住宅 IP）。 */
 export function buildDialPlan(addr, cfg) {
+  if (cfg.resForce && cfg.resGateways && cfg.resGateways.length) {
+    const n = cfg.resGateways.length;
+    const primary = Math.min(cfg.resGatewayIdx || 0, n - 1);
+    const order = [primary, ...Array.from({ length: n }, (_, i) => i).filter((i) => i !== primary)];
+    return order.map((i) => ({ kind: 'res', gw: i }));
+  }
   const plan = [];
   const chainOk = cfg.chainEnabled && cfg.chainHost;
   const chainFirst = chainOk && chainAllows(cfg, addr);
@@ -3594,7 +3828,13 @@ export function buildDialPlan(addr, cfg) {
 }
 
 /** 按计划项实际拨号 */
-function dialByKind(kind, addr, port, cfg) {
+function dialByKind(kind, addr, port, cfg, gwIdx) {
+  if (kind === 'res') {
+    const gw = (cfg.resGateways || [])[gwIdx || 0];
+    if (!gw) throw new Error('residential gateway not found');
+    const c2 = { ...cfg, chainType: 'socks5', chainHost: gw.host, chainPort: gw.port, chainUser: gw.user, chainPass: gw.pass };
+    return socks5Dial(c2, addr, port);
+  }
   if (kind === 'chain') return dialViaChain(addr, port, cfg);
   if (kind === 'proxyip') return tcpConnect(cfg.proxyIP, 443);
   return tcpConnect(addr, port);
@@ -3680,10 +3920,10 @@ export async function raceDials(fns, timeoutMs) {
  * （比如 proxyip 回落），保证回落语义不丢。 */
 async function dialOut(addr, port, cfg) {
   const plan = buildDialPlan(addr, cfg);
-  const timed = async (kind) => {
+  const timed = async (step) => {
     const t0 = Date.now();
     try {
-      const sock = await dialByKind(kind, addr, port, cfg);
+      const sock = await dialByKind(step.kind, addr, port, cfg, step.gw);
       noteDialResult(Date.now() - t0);
       return sock;
     } catch (e) {
@@ -3694,18 +3934,18 @@ async function dialOut(addr, port, cfg) {
   if (!cfg.dialRace || plan.length < 2) {
     let err = null;
     for (const step of plan) {
-      try { return await timed(step.kind); } catch (e) { err = e; }
+      try { return await timed(step); } catch (e) { err = e; }
     }
     throw err || new Error('dial failed');
   }
   const n = Math.min(plan.length, clampInt(cfg.dialConcurrency, 2, 5, 3));
   const timeoutMs = dialTimeoutFor(cfg);
   try {
-    return await raceDials(plan.slice(0, n).map((s) => () => timed(s.kind)), timeoutMs);
+    return await raceDials(plan.slice(0, n).map((s) => () => timed(s)), timeoutMs);
   } catch (e) {
     let err = e;
     for (const step of plan.slice(n)) {
-      try { return await timed(step.kind); } catch (e2) { err = e2; }
+      try { return await timed(step); } catch (e2) { err = e2; }
     }
     throw err;
   }
@@ -4318,6 +4558,7 @@ export default {
       if (path === '/api/test-source') return handleTestSource(env, url.searchParams.get('url'));
       if (path === '/api/cf-usage') return handleCfUsage(env, cfg);
       if (path === '/api/check-proxy') return handleCheckProxy(env, cfg);
+      if (path === '/api/check-res') return handleCheckRes(env, cfg);
       if (method === 'GET') return handleGetConfig(cfg, env);
       if (method === 'POST') return handlePostConfig(request, env, ctx);
       return new Response('method not allowed', { status: 405 });
@@ -4354,6 +4595,19 @@ export default {
       if (path === p) return handleSub(request, env, ctx, cfg, host, f);
     }
 
+    // 家庭 IP 独立订阅：{subPath}/res（只含住宅网关节点，与普通订阅完全分开）
+    if (cfg.resEnabled && cfg.resGateways && cfg.resGateways.length) {
+      const resBase = subBase + '/res';
+      const resRoutes = [
+        [resBase, 'res'], [resBase + '/', 'res'],
+        [resBase + '/clash', 'res-clash'], [resBase + '/singbox', 'res-singbox'],
+        [resBase + '/surge', 'res-surge'], [resBase + '/quanx', 'res-quanx'], [resBase + '/loon', 'res-loon'],
+      ];
+      for (const [p, f] of resRoutes) {
+        if (path === p) return handleSub(request, env, ctx, cfg, host, f);
+      }
+    }
+
     // WS 代理入口（按首包形状自动识别协议，v1 行为保留）
     if (isWs) {
       const seg = path.slice(1);
@@ -4364,6 +4618,35 @@ export default {
         ctx.waitUntil((async () => { try { await fn(server); } catch { /* 忽略 */ } })());
         return new Response(null, { status: 101, webSocket: client });
       };
+      // 家庭 IP 专用路径：/res/<网关序号>/<uuid|trojan|ss>，出站强制走住宅网关
+      if (seg.startsWith('res/')) {
+        if (!cfg.resEnabled || !cfg.resGateways || !cfg.resGateways.length) {
+          return new Response('residential disabled', { status: 404 });
+        }
+        const parts = seg.split('/');
+        const gwIdx = parseInt(parts[1], 10);
+        if (isNaN(gwIdx) || gwIdx < 0 || gwIdx >= cfg.resGateways.length) {
+          return new Response('bad gateway', { status: 404 });
+        }
+        const resCfg = { ...cfg, resForce: true, resGatewayIdx: gwIdx };
+        const sub = parts.slice(2).join('/');
+        if (sub === 'trojan') {
+          if (!cfg.trojanPassword) return new Response('trojan disabled', { status: 404 });
+          logAndNotifyProxy(request, env, ctx, cfg, 'res-trojan');
+          return run((s) => handleTrojan(s, request, env, resCfg, null));
+        }
+        if (sub === 'ss') {
+          if (!cfg.ssPassword) return new Response('ss disabled', { status: 404 });
+          logAndNotifyProxy(request, env, ctx, cfg, 'res-ss');
+          return run((s) => handleSs(s, request, env, resCfg));
+        }
+        if (parseUUID(sub)) {
+          if (!cfg.UUID) return new Response('uuid not configured', { status: 500 });
+          logAndNotifyProxy(request, env, ctx, cfg, 'res-vless');
+          return run((s) => handleVless(s, request, env, resCfg));
+        }
+        return new Response('Not Found', { status: 404 });
+      }
       if (seg === 'trojan' || seg.startsWith('trojan=')) {
         if (!cfg.trojanPassword) return new Response('trojan disabled', { status: 404 });
         // /trojan=IP:端口：Trojan fallback 路径，UDP 认证后透传给自建服务器
