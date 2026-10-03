@@ -1,0 +1,22 @@
+services:
+  gateway:
+    build: .
+    container_name: res-gateway
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun
+    ports:
+      - "1080:1080"
+    environment:
+      - SOCKS_USER=${SOCKS_USER:-resuser}
+      - SOCKS_PASS=${SOCKS_PASS:?请在 .env 里设置 SOCKS_PASS}
+      - SOCKS_PORT=1080
+      - COUNTRY=${COUNTRY:-JP,KR,US}
+      - CHECK_INTERVAL=${CHECK_INTERVAL:-60}
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
