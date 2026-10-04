@@ -13,6 +13,15 @@ API_URL = "https://www.vpngate.net/api/iphone/"
 # jsDelivr 镜像（官方 API 抽风时的备用，GeorgeXie2333 每小时快照）
 MIRROR_URL = "https://cdn.jsdelivr.net/gh/GeorgeXie2333/vpngate-list-mirror@latest/data/servers.json"
 OUTPUT = "/tmp/vpn.ovpn"
+BAD_NODES_FILE = "/tmp/bad_nodes.txt"
+
+def load_bad_nodes():
+    """读取本容器内已确认坏掉的节点 IP（entrypoint 拨号失败时写入）"""
+    try:
+        with open(BAD_NODES_FILE) as f:
+            return {l.strip() for l in f if l.strip()}
+    except OSError:
+        return set()
 
 def fetch_csv():
     req = urllib.request.Request(API_URL, headers={"User-Agent": "Mozilla/5.0"})
@@ -72,8 +81,12 @@ def parse_servers(text):
             continue
     return servers
 
-def pick_best(servers, countries):
+def pick_best(servers, countries, bad_nodes=None):
     """按国家偏好顺序 + 评分选最优。要求：uptime > 1小时，sessions < 50（别太挤）"""
+    bad_nodes = bad_nodes or set()
+    if bad_nodes:
+        servers = [s for s in servers if s["ip"] not in bad_nodes]
+        print(f"[selector] 已排除黑名单节点 {len(bad_nodes)} 个", flush=True)
     cands = [s for s in servers if s["country"] in countries and s["uptime"] > 3600_000 and s["sessions"] < 50]
     if not cands:
         # 放宽条件：只要国家对
@@ -107,7 +120,7 @@ def main():
             print(f"[selector] 镜像获取到 {len(servers)} 个节点", flush=True)
         except Exception as e:
             print(f"[selector] 镜像也失败: {e}", flush=True)
-    best = pick_best(servers, countries)
+    best = pick_best(servers, countries, load_bad_nodes())
     if not best:
         print("[selector] 没有找到符合条件的节点", flush=True)
         sys.exit(1)

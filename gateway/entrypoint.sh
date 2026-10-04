@@ -1,15 +1,15 @@
 #!/bin/bash
 # 住宅 IP 网关入口：选节点 → OpenVPN 拨号 → microsocks SOCKS5 → 60秒自检
 #
-# 路由设计（修复旧版环路 bug）：
-#   旧 bug：--route-nopull --route-noexec 后直接把容器默认路由换成 tun0，
-#           却没给 VPN server 留 /32 例外 → OpenVPN 控制流量进了 tun0 形成环路。
-#   新设计：
-#     1. 容器主默认路由永远不动（走 eth0 直连），选节点/DNS 等管理流量不受 VPN 影响，
-#        VPN 断了也能重新拉节点（旧版 VPN 断 = 全断，连新节点都拉不到）。
-#     2. VPN server IP 加 /32 主机路由走原网关 → OpenVPN 控制流量不进 tun0。
-#     3. microsocks 以专用 socks 用户运行，策略路由（uidrange）只把它的出站流量
-#        导入 table 100 走 tun0；其他流量一律走主表。
+# 路由设计（v2，修复 v1 的回包黑洞）：
+#   v1 bug：uidrange 规则匹配 socks 用户的"所有"出站包，包括回给 SOCKS 客户端的
+#           回包 → 回包被导入 tun0，客户端永远收不到响应，宿主机连 1080 超时。
+#   v2：iptables 只给 socks 用户发往"公网"的包打 mark，经 fwmark 规则走 tun0；
+#       发往私网/回环（回给客户端、Docker DNS 127.0.0.11）的包不打 mark，走主表。
+#   1. 容器主默认路由永远不动（走 eth0 直连），选节点/DNS 等管理流量不受 VPN 影响，
+#      VPN 断了也能重新拉节点。
+#   2. VPN server IP 加 /32 主机路由走原网关 → OpenVPN 控制流量不进 tun0。
+#   3. microsocks 以专用 socks 用户运行，公网出站经 table 100 走 tun0。
 set -u
 
 SOCKS_USER="${SOCKS_USER:-resuser}"
@@ -18,6 +18,10 @@ SOCKS_PORT="${SOCKS_PORT:-1080}"
 CHECK_INTERVAL="${CHECK_INTERVAL:-60}"
 RT_TABLE=100
 RULE_PRIO=1000
+IPT_MARK=1
+# 私网/回环：这些目标不打 mark（回包给客户端、容器 DNS 等）
+PRIVATE_NETS="127.0.0.0/8 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16"
+BAD_NODES_FILE="/tmp/bad_nodes.txt"
 
 log() { echo "[gateway $(date '+%H:%M:%S')] $*"; }
 
@@ -57,6 +61,31 @@ vpn_server_ip() {
   getent hosts "$host" | awk '{print $1; exit}'
 }
 
+# 拨号失败的节点记入黑名单（select_node.py 会跳过），避免反复选中同一坏节点
+blacklist_node() {
+  [ -n "$VPN_SRV" ] || return 0
+  if ! grep -qxF "$VPN_SRV" "$BAD_NODES_FILE" 2>/dev/null; then
+    echo "$VPN_SRV" >> "$BAD_NODES_FILE" 2>/dev/null || true
+    # 最多保留 100 条
+    tail -100 "$BAD_NODES_FILE" > "${BAD_NODES_FILE}.tmp" 2>/dev/null && \
+      mv "${BAD_NODES_FILE}.tmp" "$BAD_NODES_FILE" 2>/dev/null || true
+    log "节点 $VPN_SRV 已加入黑名单"
+  fi
+}
+
+# 清掉我们加的 mangle 规则（幂等）
+clear_iptables() {
+  [ -n "$SOCKS_UID" ] || return 0
+  command -v iptables >/dev/null 2>&1 || return 0
+  local net
+  for net in $PRIVATE_NETS; do
+    while iptables -t mangle -D OUTPUT -m owner --uid-owner "$SOCKS_UID" \
+      -d "$net" -j RETURN 2>/dev/null; do :; done
+  done
+  while iptables -t mangle -D OUTPUT -m owner --uid-owner "$SOCKS_UID" \
+    -j MARK --set-mark $IPT_MARK 2>/dev/null; do :; done
+}
+
 # 清掉 table 100 相关的旧策略规则（按 priority 逐条删）
 clear_table_rules() {
   ip rule show 2>/dev/null | grep -E "lookup ${RT_TABLE}([[:space:]]|$)" | \
@@ -68,19 +97,30 @@ clear_table_rules() {
 setup_policy_routing() {
   # 先清旧规则/旧路由（tun0 重建后必须重做）
   clear_table_rules
+  clear_iptables
   ip route flush table $RT_TABLE 2>/dev/null || true
   ip route add default dev tun0 table $RT_TABLE 2>/dev/null || {
     log "WARN: table $RT_TABLE 路由添加失败（需要 NET_ADMIN）"; return 1; }
-  ip rule add uidrange "${SOCKS_UID}-${SOCKS_UID}" table $RT_TABLE \
-    priority $RULE_PRIO 2>/dev/null || {
-    log "WARN: uidrange 策略规则添加失败"; return 1; }
-  # tun0 源地址的包也走 table 100（兜底，保证 --interface tun0 类探测可用）
+  # 私网/回环目标不打 mark（回包给 SOCKS 客户端、Docker DNS 走主表）
+  local net
+  for net in $PRIVATE_NETS; do
+    iptables -t mangle -A OUTPUT -m owner --uid-owner "$SOCKS_UID" \
+      -d "$net" -j RETURN 2>/dev/null || {
+      log "WARN: iptables 规则添加失败"; return 1; }
+  done
+  # socks 用户其余出站（公网）打 mark
+  iptables -t mangle -A OUTPUT -m owner --uid-owner "$SOCKS_UID" \
+    -j MARK --set-mark $IPT_MARK 2>/dev/null || {
+    log "WARN: iptables MARK 添加失败"; return 1; }
+  ip rule add fwmark $IPT_MARK table $RT_TABLE priority $RULE_PRIO 2>/dev/null || {
+    log "WARN: fwmark 策略规则添加失败"; return 1; }
+  # tun0 源地址的包也走 table 100（兜底）
   local tun_ip
   tun_ip=$(ip -4 addr show dev tun0 2>/dev/null | awk '/inet /{print $2}' | cut -d/ -f1 | head -1)
   if [ -n "$tun_ip" ]; then
     ip rule add from "$tun_ip" table $RT_TABLE priority $((RULE_PRIO+1)) 2>/dev/null || true
   fi
-  log "策略路由已建立（socks 用户出站走 tun0，主默认路由不动）"
+  log "策略路由已建立（iptables 标记：socks 用户公网出站走 tun0，私网/回包走主表）"
   return 0
 }
 
@@ -92,9 +132,10 @@ cleanup() {
   if [ -n "$VPN_SRV" ]; then
     ip route del "${VPN_SRV}/32" 2>/dev/null || true
   fi
-  # 清策略路由表与规则
+  # 清策略路由表、规则与 iptables 标记
   ip route flush table $RT_TABLE 2>/dev/null || true
   clear_table_rules
+  clear_iptables
   # 回退模式下恢复被替换的主默认路由
   if [ "$FALLBACK_DEFAULT" = "1" ]; then
     if [ -n "$ORIG_GW" ] && [ -n "$ORIG_IF" ]; then
@@ -135,13 +176,17 @@ connect_once() {
   if ! ip link show tun0 >/dev/null 2>&1; then
     log "tun0 未建立，查看日志："
     tail -20 /tmp/openvpn.log 2>/dev/null || true
+    blacklist_node
     return 1
   fi
   log "tun0 已建立"
-  # 策略路由：仅 microsocks（socks 用户）出站走 tun0
-  if [ -n "$SOCKS_UID" ] && setup_policy_routing; then
-    log "路由模式：策略路由（推荐）"
+  # 策略路由：仅 microsocks（socks 用户）的公网出站走 tun0
+  if [ -n "$SOCKS_UID" ] && command -v iptables >/dev/null 2>&1 && setup_policy_routing; then
+    log "路由模式：策略路由（iptables 标记）"
   else
+    # 确保无残留标记/规则再回退
+    clear_iptables; clear_table_rules
+    ip route flush table $RT_TABLE 2>/dev/null || true
     log "WARN: 策略路由不可用，回退：默认路由走 tun0（server /32 例外已加）"
     ip route replace default dev tun0 2>/dev/null || \
       log "WARN: 设置默认路由失败（需要 NET_ADMIN）"
@@ -210,6 +255,7 @@ while true; do
         log "健康检查失败 ${fail_count} 次"
         if [ "$fail_count" -ge 2 ]; then
           log "连续失败，重新拨号..."
+          blacklist_node
           break
         fi
       fi

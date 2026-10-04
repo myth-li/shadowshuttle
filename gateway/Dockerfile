@@ -1,7 +1,7 @@
 FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    openvpn curl ca-certificates iproute2 procps python3 \
+    openvpn curl ca-certificates iproute2 iptables procps python3 \
     build-essential git \
     && git clone --depth 1 https://github.com/rofl0r/microsocks.git /tmp/microsocks \
     && make -C /tmp/microsocks \
