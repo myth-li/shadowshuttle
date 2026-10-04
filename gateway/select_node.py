@@ -52,6 +52,11 @@ def pick_best(servers, countries):
         # 放宽条件：只要国家对
         cands = [s for s in servers if s["country"] in countries]
     if not cands:
+        # 兜底：首选国家无节点时，用任意可用节点（保证网关不断线）
+        cands = [s for s in servers if s["uptime"] > 3600_000 and s["sessions"] < 50]
+    if not cands:
+        cands = servers  # 最后兜底：只要有节点就用
+    if not cands:
         return None
     order = {c: i for i, c in enumerate(countries)}
     cands.sort(key=lambda s: (order.get(s["country"], 99), -s["score"]))
