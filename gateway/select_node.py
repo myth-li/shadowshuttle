@@ -10,12 +10,39 @@ import sys
 import urllib.request
 
 API_URL = "https://www.vpngate.net/api/iphone/"
+# jsDelivr 镜像（官方 API 抽风时的备用，GeorgeXie2333 每小时快照）
+MIRROR_URL = "https://cdn.jsdelivr.net/gh/GeorgeXie2333/vpngate-list-mirror@latest/data/servers.json"
 OUTPUT = "/tmp/vpn.ovpn"
 
 def fetch_csv():
     req = urllib.request.Request(API_URL, headers={"User-Agent": "Mozilla/5.0"})
     with urllib.request.urlopen(req, timeout=30) as r:
         return r.read().decode("utf-8", errors="ignore")
+
+def fetch_mirror():
+    """从 jsDelivr 镜像拉 JSON，转成统一的 server 列表"""
+    import json as _json
+    req = urllib.request.Request(MIRROR_URL, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        data = _json.loads(r.read().decode("utf-8"))
+    servers = []
+    for s in data.get("servers", []):
+        cfg_b64 = (s.get("openvpn_config_base64") or "").strip()
+        if not cfg_b64:
+            continue
+        servers.append({
+            "host": s.get("ip", ""),
+            "ip": s.get("ip", ""),
+            "score": int(s.get("score") or 0),
+            "ping": int(s.get("ping_ms") or 9999),
+            "speed": int(s.get("speed_bps") or 0),
+            "country": (s.get("country_code") or "").upper(),
+            "country_long": s.get("country_code", "").upper(),
+            "sessions": int(s.get("num_vpn_sessions") or 0),
+            "uptime": 3600_001,  # 镜像无 uptime 字段，默认视为可用
+            "config_b64": cfg_b64,
+        })
+    return servers
 
 def parse_servers(text):
     # 去掉注释行（# 开头）和末尾的 * 行
@@ -65,9 +92,21 @@ def pick_best(servers, countries):
 def main():
     countries = [c.strip().upper() for c in os.environ.get("COUNTRY", "JP,KR,US").split(",") if c.strip()]
     print(f"[selector] 国家偏好: {countries}", flush=True)
-    text = fetch_csv()
-    servers = parse_servers(text)
-    print(f"[selector] 获取到 {len(servers)} 个节点", flush=True)
+    servers = []
+    # 先试官方 API
+    try:
+        text = fetch_csv()
+        servers = parse_servers(text)
+        print(f"[selector] 官方 API 获取到 {len(servers)} 个节点", flush=True)
+    except Exception as e:
+        print(f"[selector] 官方 API 失败: {e}，尝试镜像", flush=True)
+    # 官方无节点时用 jsDelivr 镜像兜底
+    if not servers:
+        try:
+            servers = fetch_mirror()
+            print(f"[selector] 镜像获取到 {len(servers)} 个节点", flush=True)
+        except Exception as e:
+            print(f"[selector] 镜像也失败: {e}", flush=True)
     best = pick_best(servers, countries)
     if not best:
         print("[selector] 没有找到符合条件的节点", flush=True)
