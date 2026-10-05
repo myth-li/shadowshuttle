@@ -82,21 +82,18 @@ def parse_servers(text):
     return servers
 
 def pick_best(servers, countries, bad_nodes=None):
-    """按国家偏好顺序 + 评分选最优。要求：uptime > 1小时，sessions < 50（别太挤）"""
+    """只选指定国家的节点。指定国家无可用节点时返回 None（不跨国家兜底），
+    由 entrypoint 重试，保证网关出口国家与命名一致（无真实出口就宁可不下发）"""
     bad_nodes = bad_nodes or set()
     if bad_nodes:
         servers = [s for s in servers if s["ip"] not in bad_nodes]
         print(f"[selector] 已排除黑名单节点 {len(bad_nodes)} 个", flush=True)
     cands = [s for s in servers if s["country"] in countries and s["uptime"] > 3600_000 and s["sessions"] < 50]
     if not cands:
-        # 放宽条件：只要国家对
+        # 放宽条件：只要国家对（uptime/sessions 不苛求）
         cands = [s for s in servers if s["country"] in countries]
     if not cands:
-        # 兜底：首选国家无节点时，用任意可用节点（保证网关不断线）
-        cands = [s for s in servers if s["uptime"] > 3600_000 and s["sessions"] < 50]
-    if not cands:
-        cands = servers  # 最后兜底：只要有节点就用
-    if not cands:
+        print(f"[selector] 指定国家 {countries} 暂无可用节点，不跨国家兜底，等待重试", flush=True)
         return None
     order = {c: i for i, c in enumerate(countries)}
     cands.sort(key=lambda s: (order.get(s["country"], 99), -s["score"]))

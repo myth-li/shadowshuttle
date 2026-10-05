@@ -200,6 +200,18 @@ start_socks() {
 check_health() {
   # 以 socks 用户身份探测 → 流量走 tun0，测的是真实 VPN 出口
   local ip
+  ip=$(get_exit_ip)
+  if [ -z "$ip" ]; then
+    log "健康检查失败：VPN 出口无响应"
+    return 1
+  fi
+  log "健康检查 OK，当前出口 IP: $ip"
+  return 0
+}
+
+# 以 socks 用户身份取真实 VPN 出口 IP（走 tun0）
+get_exit_ip() {
+  local ip
   if [ -n "$SOCKS_UID" ]; then
     ip=$(setpriv --reuid="$SOCKS_UID" --regid="$SOCKS_UID" --clear-groups \
       curl -s -m 15 https://api.ipify.org 2>/dev/null || \
@@ -209,11 +221,52 @@ check_health() {
     ip=$(curl -s -m 15 --interface tun0 https://api.ipify.org 2>/dev/null || \
          curl -s -m 15 --interface tun0 https://ip.sb 2>/dev/null)
   fi
+  # 只接受纯 IPv4
+  if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    echo "$ip"
+  fi
+}
+
+# 校验真实出口国家：拨号后验证一次。出口国与 COUNTRY 不符 → 拉黑重拨，
+# 保证网关命名（日本/韩国/美国）与真实出口一致，绝不挂羊头卖狗肉。
+verify_exit_country() {
+  local want="${COUNTRY%%,*}"
+  want=$(echo "$want" | tr 'a-z' 'A-Z' | tr -d ' ')
+  if [ -z "$want" ]; then
+    log "未设置 COUNTRY，跳过出口国家校验"
+    return 0
+  fi
+  local ip cc
+  ip=$(get_exit_ip)
   if [ -z "$ip" ]; then
-    log "健康检查失败：VPN 出口无响应"
+    log "出口国家校验：拿不到出口 IP，稍后由健康检查处理"
+    return 0
+  fi
+  # 走 VPN 出口查该 IP 的归属国（主 ip-api.com，备 ipapi.co）
+  if [ -n "$SOCKS_UID" ]; then
+    cc=$(setpriv --reuid="$SOCKS_UID" --regid="$SOCKS_UID" --clear-groups \
+      curl -s -m 15 "http://ip-api.com/json/${ip}?fields=status,countryCode" 2>/dev/null | \
+      grep -o '"countryCode":"[A-Z]*"' | cut -d'"' -f4)
+    if [ -z "$cc" ]; then
+      cc=$(setpriv --reuid="$SOCKS_UID" --regid="$SOCKS_UID" --clear-groups \
+        curl -s -m 15 "https://ipapi.co/${ip}/country/" 2>/dev/null | tr -d ' \n\r')
+    fi
+  else
+    cc=$(curl -s -m 15 --interface tun0 "http://ip-api.com/json/${ip}?fields=status,countryCode" 2>/dev/null | \
+      grep -o '"countryCode":"[A-Z]*"' | cut -d'"' -f4)
+    [ -z "$cc" ] && cc=$(curl -s -m 15 --interface tun0 "https://ipapi.co/${ip}/country/" 2>/dev/null | tr -d ' \n\r')
+  fi
+  cc=$(echo "$cc" | tr 'a-z' 'A-Z' | tr -d ' ')
+  if [ -z "$cc" ]; then
+    log "WARN: 出口国家查询失败（$ip），本次跳过校验"
+    return 0
+  fi
+  if [ "$cc" != "$want" ]; then
+    log "出口国家不符：期望 $want，实际 $cc（$ip），拉黑重拨"
+    blacklist_node
     return 1
   fi
-  log "健康检查 OK，当前出口 IP: $ip"
+  log "出口国家校验通过：$cc（$ip）"
   return 0
 }
 
@@ -225,7 +278,7 @@ ensure_socks_user
 while true; do
   cleanup
   sleep 2
-  if connect_once && start_socks; then
+  if connect_once && start_socks && verify_exit_country; then
     log "网关已上线，开始健康检查（每 ${CHECK_INTERVAL}s）"
     fail_count=0
     while true; do
