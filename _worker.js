@@ -4604,7 +4604,8 @@ export default {
     // 管理后台与面板 API（需要会话）
     const needSession = path === '/admin' || path === '/api/config' ||
       path === '/api/logs' || path === '/api/test-source' ||
-      path === '/api/cf-usage' || path === '/api/check-proxy' || path === '/api/check-res';
+      path === '/api/cf-usage' || path === '/api/check-proxy' || path === '/api/check-res' ||
+      path === '/api/debug-tcp';
     if (needSession) {
       if (!(await checkSession(request, env))) {
         if (path === '/admin') return Response.redirect(new URL('/login', url).toString(), 302);
