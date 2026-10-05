@@ -3419,8 +3419,15 @@ async function handleCheckRes(env, cfg) {
     const t0 = Date.now();
     try {
       const c2 = { ...cfg, chainType: 'socks5', chainHost: gw.host, chainPort: gw.port, chainUser: gw.user, chainPass: gw.pass };
-      const sock = await socks5Dial(c2, 'api.ipify.org', 80);
-      const body = await httpGetBodyViaSocket(sock, 'api.ipify.org', '/');
+      // 25 秒总超时：单个网关卡住不拖死整个检测（曾导致 Worker 挂起被 runtime 杀掉）
+      const sock = await Promise.race([
+        socks5Dial(c2, 'api.ipify.org', 80),
+        new Promise((_, rej) => setTimeout(() => rej(new Error('gateway dial timeout')), 25000)),
+      ]);
+      const body = await Promise.race([
+        httpGetBodyViaSocket(sock, 'api.ipify.org', '/'),
+        new Promise((_, rej) => setTimeout(() => rej(new Error('gateway read timeout')), 15000)),
+      ]);
       const ip = body.split('\n')[0].trim();
       if (!isIP(ip)) throw new Error('出口 IP 解析失败');
       const geo = await getCachedGeo(ip, env).catch(() => null);
@@ -3940,8 +3947,15 @@ async function dialOut(addr, port, cfg) {
   };
   if (!cfg.dialRace || plan.length < 2) {
     let err = null;
+    const timeoutMs = dialTimeoutFor(cfg);
     for (const step of plan) {
-      try { return await timed(step); } catch (e) { err = e; }
+      try {
+        // 串行模式也要加超时：单个网关卡住时快速失败，切下一个（家庭 IP 故障转移）
+        return await Promise.race([
+          timed(step),
+          new Promise((_, rej) => setTimeout(() => rej(new Error('dial timeout')), timeoutMs)),
+        ]);
+      } catch (e) { err = e; }
     }
     throw err || new Error('dial failed');
   }
