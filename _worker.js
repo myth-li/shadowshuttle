@@ -3409,9 +3409,45 @@ async function handleCheckProxy(env, cfg) {
   }
 }
 
+/** GET /api/debug-tcp：调试 Worker 到指定 host:port 的 TCP 连通性，分步计时 */
+async function handleDebugTcp(env, cfg, url) {
+  const host = url.searchParams.get('host') || '35.212.128.72';
+  const port = parseInt(url.searchParams.get('port') || '1080', 10);
+  const steps = [];
+  const t0 = Date.now();
+  const mark = (s) => steps.push({ step: s, ms: Date.now() - t0 });
+  try {
+    mark('start');
+    const mod = await import('cloudflare:sockets');
+    mark('import-ok');
+    const connP = mod.connect({ hostname: host, port });
+    const sock = await Promise.race([
+      connP,
+      new Promise((_, rej) => setTimeout(() => rej(new Error('TCP connect timeout 10s')), 10000)),
+    ]);
+    mark('tcp-connected');
+    // 发 SOCKS5 greeting，看服务端回不回
+    const w = sock.writable.getWriter();
+    const r = sock.readable.getReader();
+    await w.write(new Uint8Array([0x05, 0x02, 0x00, 0x02]));
+    mark('greeting-sent');
+    const reply = await Promise.race([
+      (async () => { const { value, done } = await r.read(); return { done, hex: value ? Array.from(value.slice(0, 8)).map(b => b.toString(16).padStart(2, '0')).join('') : '' }; })(),
+      new Promise((_, rej) => setTimeout(() => rej(new Error('greeting reply timeout 10s')), 10000)),
+    ]);
+    mark('greeting-reply');
+    try { w.releaseLock(); } catch {}
+    try { r.cancel(); } catch {}
+    try { sock.close(); } catch {}
+    return json({ ok: true, host, port, steps, reply });
+  } catch (e) {
+    mark('error: ' + String(e && e.message || e).slice(0, 100));
+    return json({ ok: false, host, port, steps, error: String(e && e.message || e).slice(0, 200) });
+  }
+}
+
 /** GET /api/check-res：逐个检查住宅网关，返回各网关出口 IP */
-async function handleCheckRes(env, cfg) {
-  if (!cfg.resGateways || !cfg.resGateways.length) {
+async function handleCheckRes(env, cfg) {  if (!cfg.resGateways || !cfg.resGateways.length) {
     return json({ ok: false, error: '未配置住宅网关' });
   }
   const results = [];
@@ -4580,6 +4616,7 @@ export default {
       if (path === '/api/cf-usage') return handleCfUsage(env, cfg);
       if (path === '/api/check-proxy') return handleCheckProxy(env, cfg);
       if (path === '/api/check-res') return handleCheckRes(env, cfg);
+      if (path === '/api/debug-tcp') return handleDebugTcp(env, cfg, url);
       if (method === 'GET') return handleGetConfig(cfg, env);
       if (method === 'POST') return handlePostConfig(request, env, ctx);
       return new Response('method not allowed', { status: 405 });
