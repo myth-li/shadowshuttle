@@ -102,18 +102,33 @@ setup_policy_routing() {
     ip rule add to "$net" table main priority $RULE_PRIO_PRIV 2>/dev/null || {
       log "WARN: 私网策略规则添加失败"; return 1; }
   done
-  # socks 用户其余出站（公网）走 tun0
-  ip rule add uidrange "${SOCKS_UID}-${SOCKS_UID}" table $RT_TABLE \
-    priority $RULE_PRIO 2>/dev/null || {
-    log "WARN: uidrange 策略规则添加失败"; return 1; }
+  # v6：iptables 给 socks 用户的"新建"出站包打 mark 100 走 tun0；
+  # ESTABLISHED/RELATED 的回包不打 mark，走 main 表经 eth0 正确返回客户端。
+  # （v3-v5 的 uidrange 把回包也送进 tun0 导致 Worker 侧握手无响应。）
+  # 先清旧的 mangle 规则（幂等）
+  iptables -t mangle -D OUTPUT -m owner --uid-owner "$SOCKS_UID" \
+    -m conntrack --ctstate NEW -j MARK --set-mark 100 2>/dev/null || true
+  iptables -t mangle -A OUTPUT -m owner --uid-owner "$SOCKS_UID" \
+    -m conntrack --ctstate NEW -j MARK --set-mark 100 2>/dev/null || {
+    log "WARN: iptables mark 规则添加失败"; return 1; }
+  # fwmark 100 的包走 tun0（替代 uidrange）
+  ip rule add fwmark 100 table $RT_TABLE priority $RULE_PRIO 2>/dev/null || {
+    log "WARN: fwmark 策略规则添加失败"; return 1; }
   # tun0 源地址的包也走 table 100（兜底）
   local tun_ip
   tun_ip=$(ip -4 addr show dev tun0 2>/dev/null | awk '/inet /{print $2}' | cut -d/ -f1 | head -1)
   if [ -n "$tun_ip" ]; then
     ip rule add from "$tun_ip" table $RT_TABLE priority $((RULE_PRIO+1)) 2>/dev/null || true
   fi
-  log "策略路由已建立（uidrange + 私网直通：socks 用户公网出站走 tun0，私网/回包走主表）"
+  log "策略路由已建立（fwmark + 私网直通：socks 用户新建出站走 tun0，回包走主表）"
   return 0
+}
+
+# v6 清理：删掉我们加的 iptables mangle 规则
+clear_iptables_mangle() {
+  [ -n "$SOCKS_UID" ] || return 0
+  iptables -t mangle -D OUTPUT -m owner --uid-owner "$SOCKS_UID" \
+    -m conntrack --ctstate NEW -j MARK --set-mark 100 2>/dev/null || true
 }
 
 cleanup() {
@@ -127,6 +142,7 @@ cleanup() {
   # 清策略路由表与规则
   ip route flush table $RT_TABLE 2>/dev/null || true
   clear_policy_rules
+  clear_iptables_mangle
   # 回退模式下恢复被替换的主默认路由
   if [ "$FALLBACK_DEFAULT" = "1" ]; then
     if [ -n "$ORIG_GW" ] && [ -n "$ORIG_IF" ]; then
