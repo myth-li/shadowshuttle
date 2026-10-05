@@ -12,7 +12,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 COPY select_node.py /app/select_node.py
+COPY vpn-up.sh /app/vpn-up.sh
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
-RUN chmod +x /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh /app/vpn-up.sh
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

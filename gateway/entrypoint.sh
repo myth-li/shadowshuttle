@@ -30,11 +30,20 @@ ORIG_IF=""
 SOCKS_UID=""
 VPN_SRV=""
 FALLBACK_DEFAULT=0
+HOST_IP=""   # 本机直连出口 IP（VPN 未建时测得），用于健康检查抓直连外泄
 
 save_orig_route() {
   ORIG_GW=$(ip route show default 2>/dev/null | awk '{print $3}' | head -1)
   ORIG_IF=$(ip route show default 2>/dev/null | awk '{print $5}' | head -1)
   log "原始默认路由: via ${ORIG_GW:-?} dev ${ORIG_IF:-?}"
+  # 启动时（VPN 未建）测一次本机直连出口 IP，供健康检查识别外泄
+  HOST_IP=$(curl -s -m 10 https://api.ipify.org 2>/dev/null || curl -s -m 10 https://ip.sb 2>/dev/null || echo "")
+  if [[ "$HOST_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    log "本机直连出口 IP: $HOST_IP（健康检查将据此识别直连外泄）"
+  else
+    HOST_IP=""
+    log "WARN: 未能获取本机直连出口 IP，外泄检测降级"
+  fi
 }
 
 ensure_socks_user() {
@@ -148,8 +157,10 @@ connect_once() {
       log "WARN: VPN server 主机路由添加失败（需要 NET_ADMIN）"
   fi
   log "启动 OpenVPN..."
+  # --up /app/vpn-up.sh：tun0 每次(重)建后重建 table 100 路由，防止
+  # ping-restart 后路由丢失导致流量回落 main 表直连外泄
   openvpn --config /tmp/vpn.ovpn --dev tun0 --daemon --log /tmp/openvpn.log \
-    --route-nopull --route-noexec 2>&1 | head -5 || true
+    --route-nopull --route-noexec --script-security 2 --up /app/vpn-up.sh 2>&1 | head -5 || true
   # 等待 tun0 出现（最多 30 秒）
   for i in $(seq 1 30); do
     ip link show tun0 >/dev/null 2>&1 && break
@@ -203,6 +214,12 @@ check_health() {
   ip=$(get_exit_ip)
   if [ -z "$ip" ]; then
     log "健康检查失败：VPN 出口无响应"
+    return 1
+  fi
+  # 外泄检测：出口 IP 若等于本机直连 IP，说明 table 100 路由丢失、
+  # 流量回落 main 表直连——必须重拨，绝不能误报健康
+  if [ -n "$HOST_IP" ] && [ "$ip" = "$HOST_IP" ]; then
+    log "健康检查失败：出口 IP $ip 为本机直连（VPN 隧道旁路），触发重拨"
     return 1
   fi
   log "健康检查 OK，当前出口 IP: $ip"
