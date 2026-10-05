@@ -1,13 +1,13 @@
 #!/bin/bash
 # 住宅 IP 网关入口：选节点 → OpenVPN 拨号 → microsocks SOCKS5 → 60秒自检
 #
-# 路由设计（v2，修复 v1 的回包黑洞）：
-#   v1 bug：uidrange 规则匹配 socks 用户的"所有"出站包，包括回给 SOCKS 客户端的
-#           回包 → 回包被导入 tun0，客户端永远收不到响应，宿主机连 1080 超时。
-#   v2：iptables 只给 socks 用户发往"公网"的包打 mark，经 fwmark 规则走 tun0；
-#       发往私网/回环（回给客户端、Docker DNS 127.0.0.11）的包不打 mark，走主表。
-#   1. 容器主默认路由永远不动（走 eth0 直连），选节点/DNS 等管理流量不受 VPN 影响，
-#      VPN 断了也能重新拉节点。
+# 路由设计（v3）：
+#   v1：uidrange 把 socks 用户所有出站（含回给客户端的回包）导入 tun0 → 回包黑洞。
+#   v2：iptables 按目标打 mark，但标记链路实测不通（tunnel 本身 OK，标记后无数据）。
+#   v3：回到验证过可用的 uidrange（v1 数据通路曾拿到真实出口 IP），但加三条
+#       高优先级 `to <私网> → main` 规则（prio 999，在 uidrange prio 1000 之前），
+#       让回给 SOCKS 客户端/Docker DNS 的包走主表，只把去公网的包导入 tun0。
+#   1. 容器主默认路由永远不动（走 eth0 直连），选节点/DNS 等管理流量不受 VPN 影响。
 #   2. VPN server IP 加 /32 主机路由走原网关 → OpenVPN 控制流量不进 tun0。
 #   3. microsocks 以专用 socks 用户运行，公网出站经 table 100 走 tun0。
 set -u
@@ -18,8 +18,8 @@ SOCKS_PORT="${SOCKS_PORT:-1080}"
 CHECK_INTERVAL="${CHECK_INTERVAL:-60}"
 RT_TABLE=100
 RULE_PRIO=1000
-IPT_MARK=1
-# 私网/回环：这些目标不打 mark（回包给客户端、容器 DNS 等）
+RULE_PRIO_PRIV=999
+# 私网/回环：发往这些目标的包走主表（回包给客户端、容器 DNS 等）
 PRIVATE_NETS="127.0.0.0/8 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16"
 BAD_NODES_FILE="/tmp/bad_nodes.txt"
 
@@ -73,54 +73,37 @@ blacklist_node() {
   fi
 }
 
-# 清掉我们加的 mangle 规则（幂等）
-clear_iptables() {
-  [ -n "$SOCKS_UID" ] || return 0
-  command -v iptables >/dev/null 2>&1 || return 0
-  local net
-  for net in $PRIVATE_NETS; do
-    while iptables -t mangle -D OUTPUT -m owner --uid-owner "$SOCKS_UID" \
-      -d "$net" -j RETURN 2>/dev/null; do :; done
+# 清掉我们加的策略规则（按固定 priority 删，幂等）
+clear_policy_rules() {
+  local prio
+  for prio in $RULE_PRIO_PRIV $RULE_PRIO $((RULE_PRIO+1)); do
+    while ip rule del priority "$prio" 2>/dev/null; do :; done
   done
-  while iptables -t mangle -D OUTPUT -m owner --uid-owner "$SOCKS_UID" \
-    -j MARK --set-mark $IPT_MARK 2>/dev/null; do :; done
-}
-
-# 清掉 table 100 相关的旧策略规则（按 priority 逐条删）
-clear_table_rules() {
-  ip rule show 2>/dev/null | grep -E "lookup ${RT_TABLE}([[:space:]]|$)" | \
-    awk -F: '{print $1}' | while read -r prio; do
-      ip rule del priority "$prio" 2>/dev/null || true
-    done
 }
 
 setup_policy_routing() {
   # 先清旧规则/旧路由（tun0 重建后必须重做）
-  clear_table_rules
-  clear_iptables
+  clear_policy_rules
   ip route flush table $RT_TABLE 2>/dev/null || true
   ip route add default dev tun0 table $RT_TABLE 2>/dev/null || {
     log "WARN: table $RT_TABLE 路由添加失败（需要 NET_ADMIN）"; return 1; }
-  # 私网/回环目标不打 mark（回包给 SOCKS 客户端、Docker DNS 走主表）
+  # 私网/回环目标走主表（回包给 SOCKS 客户端、Docker DNS），优先级高于 uidrange
   local net
   for net in $PRIVATE_NETS; do
-    iptables -t mangle -A OUTPUT -m owner --uid-owner "$SOCKS_UID" \
-      -d "$net" -j RETURN 2>/dev/null || {
-      log "WARN: iptables 规则添加失败"; return 1; }
+    ip rule add to "$net" table main priority $RULE_PRIO_PRIV 2>/dev/null || {
+      log "WARN: 私网策略规则添加失败"; return 1; }
   done
-  # socks 用户其余出站（公网）打 mark
-  iptables -t mangle -A OUTPUT -m owner --uid-owner "$SOCKS_UID" \
-    -j MARK --set-mark $IPT_MARK 2>/dev/null || {
-    log "WARN: iptables MARK 添加失败"; return 1; }
-  ip rule add fwmark $IPT_MARK table $RT_TABLE priority $RULE_PRIO 2>/dev/null || {
-    log "WARN: fwmark 策略规则添加失败"; return 1; }
+  # socks 用户其余出站（公网）走 tun0
+  ip rule add uidrange "${SOCKS_UID}-${SOCKS_UID}" table $RT_TABLE \
+    priority $RULE_PRIO 2>/dev/null || {
+    log "WARN: uidrange 策略规则添加失败"; return 1; }
   # tun0 源地址的包也走 table 100（兜底）
   local tun_ip
   tun_ip=$(ip -4 addr show dev tun0 2>/dev/null | awk '/inet /{print $2}' | cut -d/ -f1 | head -1)
   if [ -n "$tun_ip" ]; then
     ip rule add from "$tun_ip" table $RT_TABLE priority $((RULE_PRIO+1)) 2>/dev/null || true
   fi
-  log "策略路由已建立（iptables 标记：socks 用户公网出站走 tun0，私网/回包走主表）"
+  log "策略路由已建立（uidrange + 私网直通：socks 用户公网出站走 tun0，私网/回包走主表）"
   return 0
 }
 
@@ -132,10 +115,9 @@ cleanup() {
   if [ -n "$VPN_SRV" ]; then
     ip route del "${VPN_SRV}/32" 2>/dev/null || true
   fi
-  # 清策略路由表、规则与 iptables 标记
+  # 清策略路由表与规则
   ip route flush table $RT_TABLE 2>/dev/null || true
-  clear_table_rules
-  clear_iptables
+  clear_policy_rules
   # 回退模式下恢复被替换的主默认路由
   if [ "$FALLBACK_DEFAULT" = "1" ]; then
     if [ -n "$ORIG_GW" ] && [ -n "$ORIG_IF" ]; then
@@ -180,12 +162,12 @@ connect_once() {
     return 1
   fi
   log "tun0 已建立"
-  # 策略路由：仅 microsocks（socks 用户）的公网出站走 tun0
-  if [ -n "$SOCKS_UID" ] && command -v iptables >/dev/null 2>&1 && setup_policy_routing; then
-    log "路由模式：策略路由（iptables 标记）"
+  # 策略路由：socks 用户公网出站走 tun0，私网/回包走主表
+  if [ -n "$SOCKS_UID" ] && setup_policy_routing; then
+    log "路由模式：策略路由（uidrange + 私网直通）"
   else
-    # 确保无残留标记/规则再回退
-    clear_iptables; clear_table_rules
+    # 确保无残留规则再回退
+    clear_policy_rules
     ip route flush table $RT_TABLE 2>/dev/null || true
     log "WARN: 策略路由不可用，回退：默认路由走 tun0（server /32 例外已加）"
     ip route replace default dev tun0 2>/dev/null || \
