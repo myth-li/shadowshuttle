@@ -1,12 +1,15 @@
 #!/bin/bash
 # 住宅 IP 网关入口：选节点 → OpenVPN 拨号 → microsocks SOCKS5 → 60秒自检
 #
-# 路由设计（v3）：
-#   v1：uidrange 把 socks 用户所有出站（含回给客户端的回包）导入 tun0 → 回包黑洞。
-#   v2：iptables 按目标打 mark，但标记链路实测不通（tunnel 本身 OK，标记后无数据）。
-#   v3：回到验证过可用的 uidrange（v1 数据通路曾拿到真实出口 IP），但加三条
-#       高优先级 `to <私网> → main` 规则（prio 999，在 uidrange prio 1000 之前），
-#       让回给 SOCKS 客户端/Docker DNS 的包走主表，只把去公网的包导入 tun0。
+# 路由设计（v7）：
+#   v5 的 uidrange 数据通路可用，但回给公网客户端（Worker）的 SYN-ACK/回包
+#   也被导入 tun0 → 回包黑洞（host 本地测试因目标是私网 IP，走 prio 999 主表，不受影响）。
+#   v6 曾试 fwmark+conntrack NEW，但三端口全挂，回退。
+#   v7：保留 uidrange（数据通路不动），加一条更高优先级规则：
+#       `sport <SOCKS_PORT> → main`（prio 998）。
+#       microsocks 回给客户端的包源端口恒为 SOCKS_PORT，直走主表经 eth0；
+#       microsocks 主动向目标站发起的连接用临时源端口，不匹配本规则，仍走 uidrange → tun0。
+#   不依赖 conntrack，纯策略路由，失败即回退到 v5 行为（安全）。
 #   1. 容器主默认路由永远不动（走 eth0 直连），选节点/DNS 等管理流量不受 VPN 影响。
 #   2. VPN server IP 加 /32 主机路由走原网关 → OpenVPN 控制流量不进 tun0。
 #   3. microsocks 以专用 socks 用户运行，公网出站经 table 100 走 tun0。
@@ -19,6 +22,7 @@ CHECK_INTERVAL="${CHECK_INTERVAL:-60}"
 RT_TABLE=100
 RULE_PRIO=1000
 RULE_PRIO_PRIV=999
+RULE_PRIO_SPORT=998
 # 私网/回环：发往这些目标的包走主表（回包给客户端、容器 DNS 等）
 PRIVATE_NETS="127.0.0.0/8 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16"
 BAD_NODES_FILE="/tmp/bad_nodes.txt"
@@ -85,7 +89,7 @@ blacklist_node() {
 # 清掉我们加的策略规则（按固定 priority 删，幂等）
 clear_policy_rules() {
   local prio
-  for prio in $RULE_PRIO_PRIV $RULE_PRIO $((RULE_PRIO+1)); do
+  for prio in $RULE_PRIO_SPORT $RULE_PRIO_PRIV $RULE_PRIO $((RULE_PRIO+1)); do
     while ip rule del priority "$prio" 2>/dev/null; do :; done
   done
 }
@@ -96,6 +100,10 @@ setup_policy_routing() {
   ip route flush table $RT_TABLE 2>/dev/null || true
   ip route add default dev tun0 table $RT_TABLE 2>/dev/null || {
     log "WARN: table $RT_TABLE 路由添加失败（需要 NET_ADMIN）"; return 1; }
+  # v7：源端口为 SOCKS 监听端口的包（即回给 SOCKS 客户端的 SYN-ACK/数据）
+  # 走主表经 eth0 直返，优先级最高。不影响 microsocks 主动外联（临时源端口）。
+  ip rule add sport "$SOCKS_PORT" table main priority $RULE_PRIO_SPORT 2>/dev/null || {
+    log "WARN: sport 策略规则添加失败（内核可能不支持 sport 匹配），回包修复未生效"; }
   # 私网/回环目标走主表（回包给 SOCKS 客户端、Docker DNS），优先级高于 uidrange
   local net
   for net in $PRIVATE_NETS; do
@@ -112,7 +120,7 @@ setup_policy_routing() {
   if [ -n "$tun_ip" ]; then
     ip rule add from "$tun_ip" table $RT_TABLE priority $((RULE_PRIO+1)) 2>/dev/null || true
   fi
-  log "策略路由已建立（uidrange + 私网直通：socks 用户公网出站走 tun0，私网/回包走主表）"
+  log "策略路由已建立（v7：sport $SOCKS_PORT 回包直返 + uidrange 公网出站走 tun0 + 私网直通）"
   return 0
 }
 
